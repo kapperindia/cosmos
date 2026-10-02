@@ -1,8 +1,10 @@
 // Run: npm install && ADMIN_PASSWORD=xxx AUDIT_KEY=yyy npm start   (use behind HTTPS)
-const express = require('express'), { DatabaseSync } = require('node:sqlite'), crypto = require('crypto');  // built into Node 22: no native build needed
+const express = require('express'), { DatabaseSync } = require('node:sqlite'), crypto = require('crypto'), path = require('path'), fs = require('fs');  // node:sqlite is built into Node 22: no native build needed
+process.on('uncaughtException', e => console.error('FATAL', e)); process.on('unhandledRejection', e => console.error('UNHANDLED', e));
 const AUDIT_KEY = process.env.AUDIT_KEY || 'change-me-audit-key';
 const H = p => crypto.scryptSync(String(p), 'election-portal-v1', 32), AH = H(process.env.ADMIN_PASSWORD || 'admin123');
-const db = new DatabaseSync(process.env.DB_PATH || 'portal.db'); db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;');
+const DB_FILE = process.env.DB_PATH || path.join(__dirname, 'portal.db'); fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+const db = new DatabaseSync(DB_FILE); db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;');
 db.transaction = fn => (...a) => { db.exec('BEGIN IMMEDIATE'); try { const r = fn(...a); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; } };
 db.exec(`
 CREATE TABLE IF NOT EXISTS members(id INTEGER PRIMARY KEY,member_id TEXT UNIQUE NOT NULL,name TEXT,mobile TEXT UNIQUE NOT NULL,email TEXT,category TEXT,eligible INTEGER DEFAULT 1);
@@ -30,7 +32,8 @@ const hits = new Map(), limit = (n, ms) => (req, res, next) => { const k = req.i
 const adminTokens = new Set(), sessions = new Map();
 const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '5mb' }));
 app.use((req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:" }); next(); });
-app.use(express.static('public'));
+app.get('/health', (_, res) => res.send('ok'));
+app.use(express.static(path.join(__dirname, 'public')));
 const admin = (req, res, next) => adminTokens.has(req.get('x-token')) ? next() : res.status(401).json({ error: 'Please log in as commissioner.' });
 const voter = (req, res, next) => { const s = sessions.get(req.get('x-session')); if (!s || s.exp < Date.now()) return res.status(401).json({ error: 'Session expired. Please verify your OTP again.' }); req.member = s.member_id; next(); };
 const view = e => {
@@ -178,4 +181,4 @@ setInterval(async () => {
     }
   }
 }, 60000);
-app.listen(process.env.PORT || 3000, () => console.log('Election portal on http://localhost:3000'));
+app.listen(process.env.PORT || 3000, () => console.log('Election portal listening on', process.env.PORT || 3000, 'db:', DB_FILE));
