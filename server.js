@@ -1,8 +1,9 @@
 // Run: npm install && ADMIN_PASSWORD=xxx AUDIT_KEY=yyy npm start   (use behind HTTPS)
-const express = require('express'), Database = require('better-sqlite3'), crypto = require('crypto');
+const express = require('express'), { DatabaseSync } = require('node:sqlite'), crypto = require('crypto');  // built into Node 22: no native build needed
 const AUDIT_KEY = process.env.AUDIT_KEY || 'change-me-audit-key';
 const H = p => crypto.scryptSync(String(p), 'election-portal-v1', 32), AH = H(process.env.ADMIN_PASSWORD || 'admin123');
-const db = new Database('portal.db'); db.pragma('foreign_keys=ON'); db.pragma('journal_mode=WAL');
+const db = new DatabaseSync(process.env.DB_PATH || 'portal.db'); db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;');
+db.transaction = fn => (...a) => { db.exec('BEGIN IMMEDIATE'); try { const r = fn(...a); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; } };
 db.exec(`
 CREATE TABLE IF NOT EXISTS members(id INTEGER PRIMARY KEY,member_id TEXT UNIQUE NOT NULL,name TEXT,mobile TEXT UNIQUE NOT NULL,email TEXT,category TEXT,eligible INTEGER DEFAULT 1);
 CREATE TABLE IF NOT EXISTS elections(id INTEGER PRIMARY KEY,code TEXT UNIQUE,name TEXT,post TEXT NOT NULL,start_at TEXT,end_at TEXT,result_at TEXT,live_candidates INTEGER DEFAULT 0,otp_ttl INTEGER DEFAULT 300,max_attempts INTEGER DEFAULT 5,locked INTEGER DEFAULT 0);
