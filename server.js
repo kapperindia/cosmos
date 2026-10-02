@@ -33,7 +33,10 @@ const adminTokens = new Set(), sessions = new Map();
 const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '5mb' }));
 app.use((req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:" }); next(); });
 app.get('/health', (_, res) => res.send('ok'));
-app.use(express.static(path.join(__dirname, 'public')));
+// Works whether index.html sits in ./public/ or in the repo root (only index.html is ever served from the root, never server.js or the database)
+const PUB = path.join(__dirname, 'public'), HOME = [path.join(PUB, 'index.html'), path.join(__dirname, 'index.html')].find(f => fs.existsSync(f));
+if (fs.existsSync(PUB)) app.use(express.static(PUB));
+app.get('/', (_, res) => HOME ? res.sendFile(HOME) : res.status(500).send('index.html not found. Place it in the public/ folder.'));
 const admin = (req, res, next) => adminTokens.has(req.get('x-token')) ? next() : res.status(401).json({ error: 'Please log in as commissioner.' });
 const voter = (req, res, next) => { const s = sessions.get(req.get('x-session')); if (!s || s.exp < Date.now()) return res.status(401).json({ error: 'Session expired. Please verify your OTP again.' }); req.member = s.member_id; next(); };
 const view = e => {
