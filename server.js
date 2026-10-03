@@ -77,6 +77,33 @@ app.post('/api/admin/members', admin, (req, res) => {
   }
   res.json({ valid: good.length, errors, imported: !req.body.dry });
 });
+app.post('/api/admin/members/add', admin, (req, res) => {
+  const mid = String(req.body.member_id || '').trim(), mob = norm(req.body.mobile), em = String(req.body.email || '').trim();
+  if (!mid) return res.status(400).json({ error: 'Member ID is required.' });
+  if (mob.length !== 10 || !/^[6-9]/.test(mob)) return res.status(400).json({ error: 'Enter a valid 10-digit mobile number.' });
+  if (em && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)) return res.status(400).json({ error: 'Invalid email address.' });
+  if (db.prepare('SELECT 1 FROM members WHERE member_id=?').get(mid)) return res.status(400).json({ error: 'This Member ID already exists.' });
+  if (db.prepare('SELECT 1 FROM members WHERE mobile=?').get(mob)) return res.status(400).json({ error: 'This mobile number already belongs to another member.' });
+  db.prepare('INSERT INTO members(member_id,name,mobile,email,category,eligible) VALUES(?,?,?,?,?,1)').run(mid, String(req.body.name || '').trim(), mob, em, String(req.body.category || '').trim());
+  log(req, 'admin', 'MEMBER_ADD', null, { member_id: mid });
+  res.json({ ok: true });
+});
+app.post('/api/admin/members/remove', admin, (req, res) => {
+  const mid = String(req.body.member_id || '').trim(), m = db.prepare('SELECT * FROM members WHERE member_id=?').get(mid);
+  if (!m) return res.status(404).json({ error: 'Member not found.' });
+  if (db.prepare('SELECT 1 FROM voter_participation WHERE member_id=?').get(m.id))
+    return res.status(400).json({ error: 'This member has already voted, so the record must be kept for the audit trail. Mark the member as not eligible instead.' });
+  db.prepare('DELETE FROM otps WHERE mobile=?').run(m.mobile);
+  db.prepare('DELETE FROM members WHERE id=?').run(m.id);
+  log(req, 'admin', 'MEMBER_REMOVE', null, { member_id: mid });
+  res.json({ ok: true });
+});
+app.post('/api/admin/members/eligible', admin, (req, res) => {
+  const mid = String(req.body.member_id || '').trim(), v = req.body.eligible ? 1 : 0;
+  if (!db.prepare('UPDATE members SET eligible=? WHERE member_id=? RETURNING id').get(v, mid)) return res.status(404).json({ error: 'Member not found.' });
+  log(req, 'admin', v ? 'MEMBER_ELIGIBLE' : 'MEMBER_INELIGIBLE', null, { member_id: mid });
+  res.json({ ok: true });
+});
 app.get('/api/admin/members', admin, (req, res) => {
   const q = `%${req.query.q || ''}%`, p = Math.max(0, +req.query.page || 0);
   const rows = db.prepare('SELECT member_id,name,mobile,email,eligible FROM members WHERE member_id LIKE ? OR name LIKE ? OR mobile LIKE ? OR email LIKE ? ORDER BY id LIMIT 20 OFFSET ?').all(q, q, q, q, p * 20).map(m => ({ ...m, mobile: 'XXXXXX' + m.mobile.slice(-4) }));
