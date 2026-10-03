@@ -18,10 +18,45 @@ input#otp{font-size:28px;letter-spacing:10px;text-align:center}:focus-visible{ou
 .bar{height:12px;border-radius:6px;background:var(--gold);margin:4px 0 10px}.ov{position:fixed;inset:0;background:#000a;display:grid;place-items:center;padding:16px;z-index:9}.md{background:var(--card);border-radius:14px;padding:20px;max-width:420px;width:100%}.row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:14px}
 table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:6px;border-bottom:1px solid var(--bd);text-align:left}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
 .sc{overflow-x:auto}.big{font-size:28px;font-weight:700}
+
+:root{--pr:#13245f;--gold:#ff9933;--ok:#138808;--onpr:#fff}
+@media(prefers-color-scheme:dark){:root{--pr:#8fb0ff;--onpr:#0f1424}header.top{background:#0a1030}}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding-bottom:84px}
+header.top{display:flex;gap:12px;align-items:center;padding:14px 18px;background:#0e1a4a;color:#fff}
+header.top .logo{width:44px;height:44px;border-radius:12px;background:var(--gold);display:grid;place-items:center;font-size:23px;flex:none}
+header.top b{display:block;font-size:18px;line-height:1.2}header.top small{opacity:.75;font-size:13px}
+nav{position:fixed;left:0;right:0;bottom:0;z-index:8;display:grid;grid-template-columns:repeat(4,1fr);gap:4px;padding:6px 8px calc(6px + env(safe-area-inset-bottom));background:var(--card);border-top:1px solid var(--bd);color:var(--tx)}
+nav button{display:flex;flex-direction:column;align-items:center;gap:2px;border:0;border-radius:12px;background:transparent;color:var(--mut);padding:6px 2px;min-height:56px;font-size:13px;font-weight:600}
+nav button i{font-style:normal;font-size:22px;line-height:1}
+nav button.on{background:var(--pr);color:var(--onpr)}
+@media(min-width:700px){body{padding-bottom:0}nav{position:sticky;top:0;bottom:auto;display:flex;justify-content:center;gap:8px;border-top:0;border-bottom:1px solid var(--bd)}nav button{flex-direction:row;gap:8px;border-radius:99px;padding:8px 20px;min-height:46px;font-size:16px}nav button i{font-size:18px}}
+.hero{background:linear-gradient(160deg,#0e1a4a,#1f45b8);text-align:left;padding:34px 18px 76px}
+.hero>div{max-width:900px;margin:auto}.hero h1{font-size:clamp(30px,7vw,52px);line-height:1.08;letter-spacing:-.02em;max-width:13em;margin:0 0 10px}
+.hero p{font-size:18px;max-width:34em;margin:0}
+.steps{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0 24px;padding:0;list-style:none}
+.steps li{display:flex;gap:8px;align-items:center;background:#ffffff22;border-radius:99px;padding:7px 14px 7px 8px;font-size:15px}
+.steps b{width:26px;height:26px;border-radius:50%;background:var(--gold);color:#111;display:grid;place-items:center;font-size:14px}
+.cta{display:flex;gap:10px;flex-wrap:wrap}.cta button{padding:15px 28px;font-size:18px;border-radius:12px}
+.stats{max-width:900px;margin:-46px auto 0;padding:0 14px;display:grid;grid-template-columns:repeat(3,1fr);gap:10px;position:relative}
+.stat{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:14px 8px;text-align:center;box-shadow:0 6px 18px #0e1a4a22}
+.stat b{display:block;font-size:28px;line-height:1.1;color:var(--pr)}.stat span{font-size:14px;color:var(--mut)}
+.chips{display:flex;gap:8px;overflow-x:auto;padding:4px 0 12px}.chips button{flex:none;background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:99px;min-height:44px;padding:8px 18px;font-size:16px}.chips button.on{background:var(--pr);color:var(--onpr);border-color:var(--pr)}
+.sec-h{display:flex;justify-content:space-between;align-items:baseline;margin:6px 0 4px}.sec-h h2{margin:0;font-size:24px}
+.ec{border-left:6px solid var(--bd);display:flex;flex-direction:column;gap:6px}.ec.OPEN{border-left-color:var(--ok)}.ec.UPCOMING{border-left-color:#3b6cf0}.ec.RESULTS{border-left-color:var(--gold)}
+.ec h3{margin:4px 0 0;font-size:24px;line-height:1.2}.ec .when{font-size:14px;color:var(--mut)}.ec button{width:100%;margin-top:auto}
+.prog{height:10px;border-radius:6px;background:var(--bd);overflow:hidden}.prog>div{height:100%;background:var(--ok);border-radius:6px}
+.empty{text-align:center;padding:34px 16px;color:var(--mut)}.empty b{display:block;font-size:20px;color:var(--tx);margin-bottom:4px}
+footer.help{max-width:900px;margin:10px auto 20px;padding:0 14px;color:var(--mut);font-size:14px;text-align:center}
+@media(prefers-reduced-motion:reduce){*{animation:none!important}}
 </style></head><body>
-<nav><b>🗳️ Online Election Portal</b><button data-v="home" class="on">Home</button><button data-v="vote">Vote Now</button><button data-v="res">Results</button><button data-v="adm">Commissioner</button></nav>
-<section id="home"><div class="hero"><h1>Online Election Portal</h1><p>Secure voting for registered members: Mobile → OTP → Select → Confirm</p><button class="g" onclick="show('vote')">Member Login / Vote Now</button> <button class="o" style="color:#fff;border-color:#fff8" onclick="show('res')">Election Results</button></div>
-<main><h2>Election Information</h2><div class="grid" id="cards"></div></main></section>
+<header class="top"><span class="logo">🗳️</span><div><b>Online Election Portal</b><small>Secure voting for registered members</small></div></header>
+<nav><button data-v="home" class="on"><i>🏠</i><span>Home</span></button><button data-v="vote"><i>🗳️</i><span>Vote</span></button><button data-v="res"><i>📊</i><span>Results</span></button><button data-v="adm"><i>🔐</i><span>Commissioner</span></button></nav>
+<section id="home"><div class="hero"><div><h1>Vote securely from your phone</h1><p>Your vote is private and counted once. It takes less than a minute.</p>
+<ol class="steps"><li><b>1</b>Enter mobile number</li><li><b>2</b>Verify OTP</li><li><b>3</b>Choose and confirm</li></ol>
+<div class="cta"><button class="g" onclick="show('vote')">Vote now</button><button class="o" style="color:#fff;border-color:#fff8" onclick="show('res')">See results</button></div></div></div>
+<div class="stats" id="stats"></div>
+<main><div class="sec-h"><h2>Elections</h2></div><div class="chips" id="chips"></div><div class="grid" id="cards"></div></main>
+<footer class="help">Use the mobile number registered with your association. Not receiving an OTP? Contact the Election Commissioner.</footer></section>
 <main><section id="vote" class="hide">
  <div class="card" id="login"><h2>Member verification</h2><label for="mob">Your registered mobile number</label><input id="mob" inputmode="numeric" autocomplete="tel" placeholder="10-digit mobile number"><button onclick="reqOtp()">Send OTP</button>
   <div id="otpbox" class="hide"><br><label for="otp">Enter the 6-digit OTP</label><input id="otp" inputmode="numeric" maxlength="6" autocomplete="one-time-code"><button class="g" onclick="verify()">Verify &amp; Continue</button></div></div>
@@ -40,9 +75,15 @@ function show(v){document.querySelectorAll('main>section,body>section').forEach(
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>show(b.dataset.v));
 function cd(e){const n=Date.now(),t=e.status=='UPCOMING'?Date.parse(e.start_at):Date.parse(e.end_at);if(!['UPCOMING','OPEN'].includes(e.status))return LBL[e.status];let s=Math.max(0,Math.floor((t-n)/1000));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return(e.status=='UPCOMING'?'Voting opens in ':'Voting closes in ')+`${d}d ${h}h ${m}m ${s%60}s`}
 setInterval(()=>document.querySelectorAll('[data-cd]').forEach(el=>{const e=E.find(x=>x.id==el.dataset.cd);if(e)el.textContent=cd(e)}),1000);
-const home=go(async()=>{E=(await api('/api/public')).elections;$('#cards').innerHTML=E.map(e=>`<div class="card"><span class="pill ${e.status}">${LBL[e.status]}</span><h3>${esc(e.post)}</h3><div class="mut">${esc(e.name)} · ${esc(e.code)}</div><p>${fmt(e.start_at)}<br>to ${fmt(e.end_at)}</p><div class="cd" data-cd="${e.id}"></div>
- ${e.status!='UPCOMING'?`<p>Registered voters: <b>${e.eligible}</b><br>Votes polled: <b>${e.polled}</b> · Turnout: <b>${e.turnout}%</b></p><div class="bar" style="width:${Math.min(100,e.turnout)}%"></div>`:''}
- ${(e.live||[]).map(c=>`<div>${esc(c.name)}: <b>${c.votes}</b></div>`).join('')}</div>`).join('')||'<p>No elections have been scheduled yet.</p>'});
+let F='all';const ORD={OPEN:0,UPCOMING:1,RESULTS:2,CLOSED:3,LOCKED:4},GRP={all:()=>true,OPEN:e=>e.status=='OPEN',UPCOMING:e=>e.status=='UPCOMING',DONE:e=>['RESULTS','CLOSED','LOCKED'].includes(e.status)};
+function paint(){const n=k=>E.filter(GRP[k]).length;$('#stats').innerHTML=`<div class="stat"><b>${n('OPEN')}</b><span>Voting open</span></div><div class="stat"><b>${n('UPCOMING')}</b><span>Upcoming</span></div><div class="stat"><b>${E.reduce((a,e)=>a+(e.polled||0),0)}</b><span>Votes cast</span></div>`;
+$('#chips').innerHTML=[['all','All'],['OPEN','Open now'],['UPCOMING','Upcoming'],['DONE','Closed &amp; results']].map(([k,t])=>`<button class="${F==k?'on':''}" onclick="F='${k}';paint()">${t} (${n(k)})</button>`).join('');
+const L=E.filter(GRP[F]).sort((a,b)=>ORD[a.status]-ORD[b.status]);
+$('#cards').innerHTML=L.map(e=>{const act=e.status=='OPEN'?`<button class="g" onclick="show('vote')">Vote now</button>`:e.status=='RESULTS'?`<button onclick="show('res')">View results</button>`:e.status=='UPCOMING'?`<button class="o" disabled>Opens ${fmt(e.start_at)}</button>`:`<button class="o" disabled>Voting closed</button>`;
+return `<div class="card ec ${e.status}"><div><span class="pill ${e.status}">${LBL[e.status]}</span></div><h3>${esc(e.post)}</h3><div class="mut">${esc(e.name)} · ${esc(e.code)}</div><div class="when">${fmt(e.start_at)} to ${fmt(e.end_at)}</div><div class="cd" data-cd="${e.id}">${cd(e)}</div>
+${e.status!='UPCOMING'?`<div class="prog"><div style="width:${Math.min(100,e.turnout)}%"></div></div><div class="mut">${e.polled} of ${e.eligible} voted (${e.turnout}% turnout)</div>`:''}
+${(e.live||[]).map(c=>`<div>${esc(c.name)}: <b>${c.votes}</b></div>`).join('')}${act}</div>`}).join('')||`<div class="empty" style="grid-column:1/-1"><b>${E.length?'Nothing in this list':'No elections yet'}</b>${E.length?'Try another filter above.':'Elections will appear here once the Commissioner schedules them.'}</div>`}
+const home=go(async()=>{E=(await api('/api/public')).elections;paint()});
 window.reqOtp=go(async()=>{await api('/api/otp/request',{mobile:$('#mob').value});$('#otpbox').classList.remove('hide');$('#otp').focus();await modal('OTP sent','An OTP has been sent to your registered mobile number.')});
 window.verify=go(async()=>{const d=await api('/api/otp/verify',{mobile:$('#mob').value,otp:$('#otp').value});S=d.session;$('#login').classList.add('hide');ballot(d.name)});
 const ballot=go(async name=>{const d=await api('/api/ballot',null,{'x-session':S});$('#ballot').innerHTML=(name?`<p>Welcome, <b>${esc(name)}</b></p>`:'')+(d.elections.map(e=>`<div class="card" style="margin-bottom:14px"><h2>${esc(e.post)}</h2><div class="mut">${esc(e.name)} · Election ID: ${esc(e.code)}</div>`+(e.voted?'<p>✅ You have already voted in this election.</p>':e.candidates.map(c=>`<label class="cand"><span class="av">${esc(c.name[0])}</span><span style="flex:1"><b>${esc(c.name)}</b><br><span class="mut">${esc(c.code)} · ${esc(c.description)}</span></span><input type="radio" name="e${e.id}" value="${c.id}" data-n="${esc(c.name)}"></label>`).join('')+`<button class="g" style="width:100%" onclick="cast(${e.id})">CAST MY VOTE</button>`)+'</div>').join('')||'<div class="card">No election is open right now.</div>')});
