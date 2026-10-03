@@ -106,8 +106,8 @@ app.post('/api/admin/members/eligible', admin, (req, res) => {
 });
 app.get('/api/admin/members', admin, (req, res) => {
   const q = `%${req.query.q || ''}%`, p = Math.max(0, +req.query.page || 0);
-  const rows = db.prepare('SELECT member_id,name,mobile,email,eligible FROM members WHERE member_id LIKE ? OR name LIKE ? OR mobile LIKE ? OR email LIKE ? ORDER BY id LIMIT 20 OFFSET ?').all(q, q, q, q, p * 20).map(m => ({ ...m, mobile: 'XXXXXX' + m.mobile.slice(-4) }));
-  res.json({ rows, uploads: db.prepare('SELECT * FROM uploads ORDER BY id DESC LIMIT 5').all() });
+  const rows = db.prepare('SELECT member_id,name,mobile,email,eligible FROM members WHERE member_id LIKE ? OR name LIKE ? OR mobile LIKE ? OR email LIKE ? ORDER BY id DESC LIMIT 20 OFFSET ?').all(q, q, q, q, p * 20).map(m => ({ ...m, mobile: 'XXXXXX' + m.mobile.slice(-4) }));
+  res.json({ rows, total: db.prepare('SELECT COUNT(*) c FROM members WHERE member_id LIKE ? OR name LIKE ? OR mobile LIKE ? OR email LIKE ?').get(q, q, q, q).c, uploads: db.prepare('SELECT * FROM uploads ORDER BY id DESC LIMIT 5').all() });
 });
 app.post('/api/admin/elections', admin, (req, res) => {
   const { name, post, start_at, end_at, result_at, candidates } = req.body;
