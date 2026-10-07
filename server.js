@@ -58,8 +58,23 @@ app.get('/api/admin/dashboard', admin, (req, res) => {
   const c = q => db.prepare(q).get().c, els = db.prepare('SELECT * FROM elections ORDER BY id').all().map(view);
   res.json({ members: c('SELECT COUNT(*) c FROM members'), eligible: c('SELECT COUNT(*) c FROM members WHERE eligible=1'), candidates: c('SELECT COUNT(*) c FROM candidates WHERE active=1'), active: els.filter(e => e.status === 'OPEN').length, completed: els.filter(e => ['CLOSED', 'RESULTS'].includes(e.status)).length, votes: c('SELECT COUNT(*) c FROM voter_participation'), elections: els });
 });
+
+// Mirrors each member-file upload to Supabase (versioned by filename, keyed by mobile). Optional: needs SUPABASE_URL + SUPABASE_SERVICE_KEY.
+async function saveToSupabase(filename, rows, rejected) {
+  const url = process.env.SUPABASE_URL, key = process.env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) return { skipped: 'Supabase is not configured.' };
+  try {
+    const payload = rows.map(g => ({ mobile: g.mob, member_id: g.mid, name: g.name, email: g.em, category: g.cat, eligible: !!g.el }));
+    const hash = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+    const r = await fetch(url.replace(/\/$/, '') + '/rest/v1/rpc/save_member_file', { method: 'POST', headers: { apikey: key, Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' }, body: JSON.stringify({ p_filename: filename || 'unnamed', p_hash: hash, p_rows: payload, p_rejected: rejected }) });
+    const d = await r.json();
+    if (!r.ok) return { error: d.message || 'Supabase rejected the upload.' };
+    const x = Array.isArray(d) ? d[0] : d;
+    return { version: x.version, uploaded_at: x.uploaded_at, filename: filename || 'unnamed' };
+  } catch (e) { return { error: 'Could not reach Supabase.' }; }
+}
 // Members: dry-run validation first, then import valid rows
-app.post('/api/admin/members', admin, (req, res) => {
+app.post('/api/admin/members', admin, async (req, res) => {
   const rows = req.body.rows || [], errors = [], seenM = new Set(), seenId = new Set(), good = [];
   rows.forEach((r, i) => {
     const row = i + 2, mob = norm(r.mobile), mid = String(r.member_id || '').trim(), em = String(r.email || '').trim(), bad = [];
@@ -75,7 +90,8 @@ app.post('/api/admin/members', admin, (req, res) => {
     db.prepare('INSERT INTO uploads(at,filename,imported,rejected) VALUES(?,?,?,?)').run(new Date().toISOString(), req.body.filename || '', good.length, errors.length);
     log(req, 'admin', 'MEMBER_UPLOAD', null, { imported: good.length, rejected: errors.length });
   }
-  res.json({ valid: good.length, errors, imported: !req.body.dry });
+  const saved = req.body.dry ? undefined : await saveToSupabase(req.body.filename, good, errors.length);
+  res.json({ valid: good.length, errors, imported: !req.body.dry, saved });
 });
 app.post('/api/admin/members/add', admin, (req, res) => {
   const mid = String(req.body.member_id || '').trim(), mob = norm(req.body.mobile), em = String(req.body.email || '').trim();
@@ -163,6 +179,11 @@ app.get('/api/results/:id', (req, res) => {
 
 // ================= OTP + voting =================
 const cfg = () => db.prepare('SELECT * FROM elections').all().find(e => status(e) === 'OPEN') || { otp_ttl: 300, max_attempts: 5 };
+app.post('/api/member/lookup', limit(10, 600000), (req, res) => {
+  const mobile = norm(req.body.mobile), m = db.prepare('SELECT name,member_id FROM members WHERE mobile=? AND eligible=1').get(mobile);
+  if (!m) { log(req, 'member', 'LOOKUP_NOT_FOUND', null, 'XXXXXX' + mobile.slice(-4)); return res.status(404).json({ error: 'This mobile number is not registered for this election.' }); }
+  res.json({ name: m.name || 'Member', member_id: m.member_id });
+});
 app.post('/api/otp/request', limit(6, 600000), async (req, res) => {
   const mobile = norm(req.body.mobile), m = db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile);
   if (!m) { log(req, 'member', 'OTP_REJECTED_NOT_ELIGIBLE', null, 'XXXXXX' + mobile.slice(-4)); return res.status(403).json({ error: 'Mobile number is not registered for this election.' }); }
