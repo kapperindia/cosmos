@@ -39,8 +39,26 @@ CREATE TABLE IF NOT EXISTS uploads(id INTEGER PRIMARY KEY,at TEXT,filename TEXT,
 CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY,at TEXT DEFAULT CURRENT_TIMESTAMP,actor TEXT,action TEXT,election_id INTEGER,detail TEXT,ip TEXT);
 CREATE TRIGGER IF NOT EXISTS al_u BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT,'audit log is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS al_d BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT,'audit log is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS ba_u BEFORE UPDATE ON ballots BEGIN SELECT RAISE(ABORT,'ballots are permanent and cannot be modified'); END;
+CREATE TRIGGER IF NOT EXISTS ba_d BEFORE DELETE ON ballots BEGIN SELECT RAISE(ABORT,'ballots are permanent and cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS vp_u BEFORE UPDATE ON voter_participation BEGIN SELECT RAISE(ABORT,'voter records are permanent and cannot be modified'); END;
+CREATE TRIGGER IF NOT EXISTS vp_d BEFORE DELETE ON voter_participation BEGIN SELECT RAISE(ABORT,'voter records are permanent and cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS nl_u BEFORE UPDATE ON notification_logs BEGIN SELECT RAISE(ABORT,'notification logs are permanent and cannot be modified'); END;
+CREATE TRIGGER IF NOT EXISTS nl_d BEFORE DELETE ON notification_logs BEGIN SELECT RAISE(ABORT,'notification logs are permanent and cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS up_u BEFORE UPDATE ON uploads BEGIN SELECT RAISE(ABORT,'upload history are permanent and cannot be modified'); END;
+CREATE TRIGGER IF NOT EXISTS up_d BEFORE DELETE ON uploads BEGIN SELECT RAISE(ABORT,'upload history are permanent and cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS el_d BEFORE DELETE ON elections BEGIN SELECT RAISE(ABORT,'elections cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS ca_d BEFORE DELETE ON candidates BEGIN SELECT RAISE(ABORT,'candidates cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS me_d BEFORE DELETE ON members WHEN EXISTS(SELECT 1 FROM voter_participation WHERE member_id=OLD.id) BEGIN SELECT RAISE(ABORT,'a member who has voted cannot be deleted'); END;
 `);
-const log = (req, actor, action, eid, detail) => db.prepare('INSERT INTO audit_log(actor,action,election_id,detail,ip) VALUES(?,?,?,?,?)').run(actor, action, eid || null, typeof detail === 'string' ? detail : JSON.stringify(detail || ''), req.ip);
+try { db.exec('ALTER TABLE audit_log ADD COLUMN hash TEXT'); } catch (e) { /* column already exists */ }
+const chainHash = (prev, r) => crypto.createHash('sha256').update([prev, r.at, r.actor, r.action, r.election_id ?? '', r.detail ?? '', r.ip ?? ''].join('|')).digest('hex');
+// Every audit entry carries a hash of itself + the previous entry's hash, so any later tampering breaks the chain and is detectable
+const log = (req, actor, action, eid, detail) => {
+  const r = { at: new Date().toISOString(), actor, action, election_id: eid || null, detail: typeof detail === 'string' ? detail : JSON.stringify(detail || ''), ip: String(req.ip || '') };
+  const prev = db.prepare('SELECT hash FROM audit_log WHERE hash IS NOT NULL ORDER BY id DESC LIMIT 1').get()?.hash || '';
+  db.prepare('INSERT INTO audit_log(at,actor,action,election_id,detail,ip,hash) VALUES(?,?,?,?,?,?,?)').run(r.at, r.actor, r.action, r.election_id, r.detail, r.ip, chainHash(prev, r));
+};
 // ---- SMS / email: plug in your provider (MSG91, Twilio, SES, SMTP). Return true on success. ----
 const sendSms = async (mobile, text) => { console.log(`[SMS ${mobile}] ${text}`); return true; };
 const sendEmail = async (to, subject, text) => { if (!to) return false; console.log(`[EMAIL ${to}] ${subject}: ${text}`); return true; };
@@ -49,7 +67,7 @@ const norm = m => String(m || '').replace(/\D/g, '').slice(-10), hash = s => cry
 const status = e => { const n = Date.now(); if (e.locked) return 'LOCKED'; if (n < Date.parse(e.start_at)) return 'UPCOMING'; if (n <= Date.parse(e.end_at)) return 'OPEN'; return n >= Date.parse(e.result_at || e.end_at) ? 'RESULTS' : 'CLOSED'; };
 const hits = new Map(), limit = (n, ms) => (req, res, next) => { const k = req.ip + req.path, now = Date.now(), a = (hits.get(k) || []).filter(t => now - t < ms); a.push(now); hits.set(k, a); a.length > n ? res.status(429).json({ error: 'Too many attempts. Please try again later.' }) : next(); };
 const adminTokens = new Set(), sessions = new Map();
-const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '5mb' }));
+const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '12mb' }));
 // Mark the database "changed" after any successful write so the background job backs it up
 let dirty = false; app.use((req, res, next) => { if (req.method !== 'GET' && req.path.startsWith('/api/')) res.on('finish', () => { if (res.statusCode < 400) dirty = true; }); next(); });
 
@@ -215,6 +233,38 @@ app.get('/api/admin/report/:id', admin, (req, res) => {
 app.post('/api/admin/notices', admin, (req, res) => { if (!req.body.message) return res.status(400).json({ error: 'Message required' }); db.prepare('INSERT INTO notices(message,send_at) VALUES(?,?)').run(req.body.message, req.body.send_at || new Date().toISOString()); log(req, 'admin', 'NOTICE_SCHEDULED'); res.json({ ok: true }); });
 app.get('/api/admin/notices', admin, (req, res) => res.json(db.prepare(`SELECT n.id,n.message,n.send_at,n.sent,(SELECT COUNT(*) FROM notification_logs WHERE notice_id=n.id AND status='SENT') ok,(SELECT COUNT(*) FROM notification_logs WHERE notice_id=n.id AND status='FAILED') failed FROM notices n ORDER BY id DESC LIMIT 10`).all()));
 // Restricted audit mode: key + written reason, always logged. Ballots cannot be linked to voters by design.
+// Voted / yet-to-vote lists (who participated, never whom they voted for)
+app.get('/api/admin/participation/:id', admin, (req, res) => {
+  const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id); if (!e) return res.status(404).json({ error: 'Election not found.' });
+  const voted = db.prepare('SELECT m.member_id,m.name,m.mobile,m.category,p.voted_at FROM voter_participation p JOIN members m ON m.id=p.member_id WHERE p.election_id=? ORDER BY p.voted_at DESC').all(e.id);
+  const pending = db.prepare('SELECT member_id,name,mobile,category FROM members WHERE eligible=1 AND id NOT IN (SELECT member_id FROM voter_participation WHERE election_id=?) ORDER BY member_id').all(e.id);
+  if (req.query.log) log(req, 'admin', 'VOTER_LIST_VIEWED', e.id, { voted: voted.length, pending: pending.length });
+  res.json({ election: view(e), voted, pending });
+});
+app.get('/api/admin/mis/:id', admin, (req, res) => {
+  const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id); if (!e) return res.status(404).json({ error: 'Election not found.' });
+  const v = view(e), closed = ['CLOSED', 'RESULTS'].includes(v.status) || !!e.live_candidates;
+  res.json({
+    status: v.status, eligible: v.eligible, polled: v.polled, turnout: v.turnout,
+    categories: db.prepare("SELECT COALESCE(NULLIF(m.category,''),'Uncategorised') cat, COUNT(*) eligible, SUM(CASE WHEN p.id IS NOT NULL THEN 1 ELSE 0 END) voted FROM members m LEFT JOIN voter_participation p ON p.member_id=m.id AND p.election_id=? WHERE m.eligible=1 GROUP BY cat ORDER BY cat").all(e.id),
+    hourly: db.prepare("SELECT substr(voted_at,1,13)||':00:00Z' h, COUNT(*) n FROM voter_participation WHERE election_id=? GROUP BY 1 ORDER BY 1").all(e.id),
+    first_vote: db.prepare('SELECT MIN(voted_at) t FROM voter_participation WHERE election_id=?').get(e.id).t, last_vote: db.prepare('SELECT MAX(voted_at) t FROM voter_participation WHERE election_id=?').get(e.id).t,
+    results: closed ? tally(e.id) : null   // candidate-wise counts stay hidden until voting closes (ballot secrecy)
+  });
+});
+// Integrity check: audit chain + ballots-vs-voters reconciliation + fingerprints that can be recorded for later verification
+app.get('/api/admin/integrity', admin, (req, res) => {
+  let prev = '', n = 0, bad = null;
+  for (const r of db.prepare('SELECT * FROM audit_log WHERE hash IS NOT NULL ORDER BY id').all()) { if (chainHash(prev, r) !== r.hash) { bad = r.id; break; } prev = r.hash; n++; }
+  const dig = rows => crypto.createHash('sha256').update(rows.join('\n')).digest('hex');
+  const elections = db.prepare('SELECT * FROM elections ORDER BY id').all().map(e => {
+    const p = db.prepare('SELECT m.member_id FROM voter_participation p JOIN members m ON m.id=p.member_id WHERE p.election_id=? ORDER BY m.member_id').all(e.id).map(x => x.member_id), b = db.prepare('SELECT txn_id,candidate_id FROM ballots WHERE election_id=? ORDER BY txn_id').all(e.id).map(x => x.txn_id + ':' + x.candidate_id);
+    return { code: e.code, post: e.post, voters: p.length, ballots: b.length, match: p.length === b.length, voters_fingerprint: dig(p), ballots_fingerprint: dig(b) };
+  });
+  const out = { checked_at: new Date().toISOString(), audit_entries: n, audit_chain_ok: bad === null, first_bad_entry: bad, all_match: elections.every(e => e.match), elections };
+  log(req, 'admin', 'INTEGRITY_CHECK', null, { chain_ok: out.audit_chain_ok, all_match: out.all_match });
+  res.json(out);
+});
 app.post('/api/admin/audit', admin, limit(5, 60000), (req, res) => {
   const { key, reason, election_id } = req.body;
   if (key !== AUDIT_KEY) { log(req, 'admin', 'RESTRICTED_AUDIT_DENIED', election_id, reason); return res.status(403).json({ error: 'Invalid audit key.' }); }
@@ -233,15 +283,19 @@ app.get('/api/results/:id', (req, res) => {
 
 // ================= OTP + voting =================
 const cfg = () => db.prepare('SELECT * FROM elections').all().find(e => status(e) === 'OPEN') || { otp_ttl: 300, max_attempts: 5 };
+const openStatus = m => db.prepare('SELECT * FROM elections').all().filter(e => status(e) === 'OPEN').map(e => ({ id: e.id, code: e.code, post: e.post, voted: !!db.prepare('SELECT 1 FROM voter_participation WHERE election_id=? AND member_id=?').get(e.id, m.id) }));
 app.post('/api/member/lookup', limit(10, 600000), (req, res) => {
-  const mobile = norm(req.body.mobile), m = db.prepare('SELECT name,member_id FROM members WHERE mobile=? AND eligible=1').get(mobile);
+  const mobile = norm(req.body.mobile), m = db.prepare('SELECT id,name,member_id FROM members WHERE mobile=? AND eligible=1').get(mobile);
   if (!m) { log(req, 'member', 'LOOKUP_NOT_FOUND', null, 'XXXXXX' + mobile.slice(-4)); return res.status(404).json({ error: 'This mobile number is not registered for this election.' }); }
-  res.json({ name: m.name || 'Member', member_id: m.member_id });
+  const elections = openStatus(m), all = db.prepare('SELECT * FROM elections').all().map(status);
+  const state = !elections.length ? (all.includes('UPCOMING') ? 'not_started' : 'ended') : elections.every(e => e.voted) ? 'all_voted' : 'can_vote';
+  res.json({ name: m.name || 'Member', member_id: m.member_id, elections, state });
 });
 app.post('/api/otp/request', limit(6, 600000), async (req, res) => {
   const mobile = norm(req.body.mobile), m = db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile);
   if (!m) { log(req, 'member', 'OTP_REJECTED_NOT_ELIGIBLE', null, 'XXXXXX' + mobile.slice(-4)); return res.status(403).json({ error: 'Mobile number is not registered for this election.' }); }
-  const els = db.prepare('SELECT * FROM elections').all().map(status);
+  const els = db.prepare('SELECT * FROM elections').all().map(status), ops = openStatus(m);
+  if (ops.length && ops.every(e => e.voted)) { log(req, 'member:' + m.member_id, 'OTP_BLOCKED_ALREADY_VOTED'); return res.status(400).json({ error: 'You have already voted. Voting is allowed only once, so no OTP will be sent.' }); }
   if (!els.includes('OPEN')) return res.status(400).json({ error: els.includes('UPCOMING') ? 'Voting has not started yet.' : 'Voting has ended.' });
   const o = db.prepare('SELECT * FROM otps WHERE mobile=?').get(mobile);
   if (o && Date.now() - o.sent_at < 30000) return res.status(429).json({ error: 'Please wait 30 seconds before requesting another OTP.' });
@@ -286,4 +340,11 @@ setInterval(async () => {
     }
   }
 }, 60000);
+// Always answer API problems with JSON (never an HTML error page), so the screens can show a clear message
+app.use('/api', (req, res) => res.status(404).json({ error: `Server is out of date: ${req.method} ${req.originalUrl.split('?')[0]} does not exist. Upload the latest server.js and redeploy.` }));
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'The file is too large to upload (limit about 8 MB).' });
+  if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'The upload was not valid. Please try again.' });
+  console.error('ERROR', err); res.status(500).json({ error: 'Server error. Please try again.' });
+});
 app.listen(process.env.PORT || 3000, () => console.log('Election portal listening on', process.env.PORT || 3000, 'db:', DB_FILE));
