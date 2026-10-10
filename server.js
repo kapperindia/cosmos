@@ -4,6 +4,25 @@ process.on('uncaughtException', e => console.error('FATAL', e)); process.on('unh
 const AUDIT_KEY = process.env.AUDIT_KEY || 'change-me-audit-key';
 const H = p => crypto.scryptSync(String(p), 'election-portal-v1', 32), AH = H(process.env.ADMIN_PASSWORD || 'admin123');
 const DB_FILE = process.env.DB_PATH || path.join(__dirname, 'portal.db'); fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+// ---- Durability: if the host wiped the database file on redeploy, restore the latest snapshot from Supabase Storage BEFORE opening it ----
+(function restoreIfNeeded() {
+  const url = (process.env.SUPABASE_URL || '').replace(/\/$/, ''), key = process.env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) return;
+  try {
+    let needs = !fs.existsSync(DB_FILE) || fs.statSync(DB_FILE).size === 0;
+    if (!needs) { // a freshly created, still-empty database also counts as "wiped"
+      try { const t = new DatabaseSync(DB_FILE); const n = t.prepare("SELECT (SELECT COUNT(*) FROM sqlite_master WHERE name IN ('members','elections')) t").get().t;
+        needs = n < 2 || (t.prepare('SELECT COUNT(*) c FROM members').get().c === 0 && t.prepare('SELECT COUNT(*) c FROM elections').get().c === 0); t.close(); } catch (e) { needs = true; }
+    }
+    if (!needs) return;
+    const code = `fetch(process.env.U+'/storage/v1/object/backups/portal-latest.db',{headers:{apikey:process.env.K,Authorization:'Bearer '+process.env.K}}).then(async r=>{if(!r.ok)process.exit(2);require('fs').writeFileSync(process.env.T,Buffer.from(await r.arrayBuffer()))}).catch(()=>process.exit(3))`;
+    const tmp = DB_FILE + '.restore';
+    require('child_process').execFileSync(process.execPath, ['-e', code], { env: { ...process.env, U: url, K: key, T: tmp }, timeout: 60000 });
+    if (fs.readFileSync(tmp).subarray(0, 15).toString() !== 'SQLite format 3') throw new Error('downloaded backup is not a valid database');
+    for (const x of ['', '-wal', '-shm']) fs.rmSync(DB_FILE + x, { force: true });
+    fs.renameSync(tmp, DB_FILE); console.log('RESTORED database from Supabase backup');
+  } catch (e) { console.log('No backup restored:', e.status === 2 ? 'no backup exists yet' : e.message); }
+})();
 const db = new DatabaseSync(DB_FILE); db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;');
 db.transaction = fn => (...a) => { db.exec('BEGIN IMMEDIATE'); try { const r = fn(...a); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; } };
 db.exec(`
@@ -31,6 +50,9 @@ const status = e => { const n = Date.now(); if (e.locked) return 'LOCKED'; if (n
 const hits = new Map(), limit = (n, ms) => (req, res, next) => { const k = req.ip + req.path, now = Date.now(), a = (hits.get(k) || []).filter(t => now - t < ms); a.push(now); hits.set(k, a); a.length > n ? res.status(429).json({ error: 'Too many attempts. Please try again later.' }) : next(); };
 const adminTokens = new Set(), sessions = new Map();
 const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '5mb' }));
+// Mark the database "changed" after any successful write so the background job backs it up
+let dirty = false; app.use((req, res, next) => { if (req.method !== 'GET' && req.path.startsWith('/api/')) res.on('finish', () => { if (res.statusCode < 400) dirty = true; }); next(); });
+
 app.use((req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:" }); next(); });
 app.get('/health', (_, res) => res.send('ok'));
 // Works whether index.html sits in ./public/ or in the repo root (only index.html is ever served from the root, never server.js or the database)
@@ -59,20 +81,50 @@ app.get('/api/admin/dashboard', admin, (req, res) => {
   res.json({ members: c('SELECT COUNT(*) c FROM members'), eligible: c('SELECT COUNT(*) c FROM members WHERE eligible=1'), candidates: c('SELECT COUNT(*) c FROM candidates WHERE active=1'), active: els.filter(e => e.status === 'OPEN').length, completed: els.filter(e => ['CLOSED', 'RESULTS'].includes(e.status)).length, votes: c('SELECT COUNT(*) c FROM voter_participation'), elections: els });
 });
 
-// Mirrors each member-file upload to Supabase (versioned by filename, keyed by mobile). Optional: needs SUPABASE_URL + SUPABASE_SERVICE_KEY.
-async function saveToSupabase(filename, rows, rejected) {
-  const url = process.env.SUPABASE_URL, key = process.env.SUPABASE_SERVICE_KEY;
-  if (!url || !key) return { skipped: 'Supabase is not configured.' };
+// ---- Supabase helpers (optional; need SUPABASE_URL + SUPABASE_SERVICE_KEY) ----
+const SBU = () => (process.env.SUPABASE_URL || '').replace(/\/$/, ''), SBK = () => process.env.SUPABASE_SERVICE_KEY || '';
+const sbHeaders = extra => ({ apikey: SBK(), Authorization: 'Bearer ' + SBK(), ...extra });
+async function sbStore(bucket, objPath, buf, type) {
+  const r = await fetch(`${SBU()}/storage/v1/object/${bucket}/${objPath.split('/').map(encodeURIComponent).join('/')}`, { method: 'POST', headers: sbHeaders({ 'Content-Type': type || 'application/octet-stream', 'x-upsert': 'true' }), body: buf });
+  if (!r.ok) throw new Error('Storage upload failed (' + r.status + ')');
+}
+// Each member-file upload: rows saved as a new version (same filename => next version, keyed by mobile) + the original file kept in Storage
+async function saveToSupabase(filename, rows, rejected, fileB64) {
+  if (!SBU() || !SBK()) return { skipped: 'Supabase is not configured.' };
   try {
     const payload = rows.map(g => ({ mobile: g.mob, member_id: g.mid, name: g.name, email: g.em, category: g.cat, eligible: !!g.el }));
-    const hash = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
-    const r = await fetch(url.replace(/\/$/, '') + '/rest/v1/rpc/save_member_file', { method: 'POST', headers: { apikey: key, Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' }, body: JSON.stringify({ p_filename: filename || 'unnamed', p_hash: hash, p_rows: payload, p_rejected: rejected }) });
+    const hash = crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex'), fname = filename || 'unnamed';
+    const r = await fetch(SBU() + '/rest/v1/rpc/save_member_file', { method: 'POST', headers: sbHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ p_filename: fname, p_hash: hash, p_rows: payload, p_rejected: rejected }) });
     const d = await r.json();
     if (!r.ok) return { error: d.message || 'Supabase rejected the upload.' };
-    const x = Array.isArray(d) ? d[0] : d;
-    return { version: x.version, uploaded_at: x.uploaded_at, filename: filename || 'unnamed' };
-  } catch (e) { return { error: 'Could not reach Supabase.' }; }
+    const x = Array.isArray(d) ? d[0] : d; let stored = false;
+    if (fileB64) { // original file, e.g. members.xlsx/v2_2026-10-10T04-30-00Z_members.xlsx
+      const safe = fname.replace(/[^\w.\-]+/g, '_'), p = `${safe}/v${x.version}_${new Date(x.uploaded_at).toISOString().replace(/[:.]/g, '-')}_${safe}`;
+      await sbStore('member-files', p, Buffer.from(fileB64, 'base64'));
+      await fetch(`${SBU()}/rest/v1/member_files?id=eq.${x.file_id}`, { method: 'PATCH', headers: sbHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ storage_path: p }) }); stored = true;
+    }
+    return { version: x.version, uploaded_at: x.uploaded_at, filename: fname, file_stored: stored };
+  } catch (e) { return { error: 'Could not save to Supabase: ' + e.message }; }
 }
+// ---- Database snapshots: a consistent copy of the whole database is uploaded to Supabase Storage after changes, and once a day ----
+let backing = false, lastBackup = null, lastBackupError = null;
+async function backupNow(daily) {
+  if (!SBU() || !SBK()) return { skipped: true };
+  if (backing) return { busy: true }; backing = true;
+  try {
+    const tmp = DB_FILE + '.snapshot'; fs.rmSync(tmp, { force: true }); db.exec(`VACUUM INTO '${tmp.replace(/'/g, "''")}'`);
+    const buf = fs.readFileSync(tmp); fs.rmSync(tmp, { force: true });
+    await sbStore('backups', 'portal-latest.db', buf);
+    if (daily) await sbStore('backups', `daily/portal-${new Date().toISOString().slice(0, 10)}.db`, buf);
+    dirty = false; lastBackup = new Date().toISOString(); lastBackupError = null; return { ok: true, at: lastBackup };
+  } catch (e) { lastBackupError = e.message; console.error('Backup failed:', e.message); return { error: e.message }; } finally { backing = false; }
+}
+setInterval(() => { if (dirty) backupNow(false); }, 20000);
+setInterval(() => backupNow(true), 6 * 3600 * 1000);
+setTimeout(() => backupNow(true), 15000);
+process.on('SIGTERM', async () => { await backupNow(false); process.exit(0); });
+app.post('/api/admin/backup', admin, async (req, res) => res.json(await backupNow(true)));
+app.get('/api/admin/backup', admin, (req, res) => res.json({ configured: !!(SBU() && SBK()), last: lastBackup, error: lastBackupError }));
 // Members: dry-run validation first, then import valid rows
 app.post('/api/admin/members', admin, async (req, res) => {
   const rows = req.body.rows || [], errors = [], seenM = new Set(), seenId = new Set(), good = [];
@@ -90,7 +142,7 @@ app.post('/api/admin/members', admin, async (req, res) => {
     db.prepare('INSERT INTO uploads(at,filename,imported,rejected) VALUES(?,?,?,?)').run(new Date().toISOString(), req.body.filename || '', good.length, errors.length);
     log(req, 'admin', 'MEMBER_UPLOAD', null, { imported: good.length, rejected: errors.length });
   }
-  const saved = req.body.dry ? undefined : await saveToSupabase(req.body.filename, good, errors.length);
+  const saved = req.body.dry ? undefined : await saveToSupabase(req.body.filename, good, errors.length, req.body.file_b64);
   res.json({ valid: good.length, errors, imported: !req.body.dry, saved });
 });
 app.post('/api/admin/members/add', admin, (req, res) => {
@@ -122,7 +174,7 @@ app.post('/api/admin/members/eligible', admin, (req, res) => {
 });
 app.get('/api/admin/members', admin, (req, res) => {
   const q = `%${req.query.q || ''}%`, p = Math.max(0, +req.query.page || 0);
-  const rows = db.prepare('SELECT member_id,name,mobile,email,eligible FROM members WHERE member_id LIKE ? OR name LIKE ? OR mobile LIKE ? OR email LIKE ? ORDER BY id DESC LIMIT 20 OFFSET ?').all(q, q, q, q, p * 20).map(m => ({ ...m, mobile: 'XXXXXX' + m.mobile.slice(-4) }));
+  const rows = db.prepare('SELECT member_id,name,mobile,email,eligible FROM members WHERE member_id LIKE ? OR name LIKE ? OR mobile LIKE ? OR email LIKE ? ORDER BY id DESC LIMIT 20 OFFSET ?').all(q, q, q, q, p * 20);
   res.json({ rows, total: db.prepare('SELECT COUNT(*) c FROM members WHERE member_id LIKE ? OR name LIKE ? OR mobile LIKE ? OR email LIKE ?').get(q, q, q, q).c, uploads: db.prepare('SELECT * FROM uploads ORDER BY id DESC LIMIT 5').all() });
 });
 app.post('/api/admin/elections', admin, (req, res) => {
