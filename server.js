@@ -127,13 +127,15 @@ app.post('/api/admin/backup', admin, async (req, res) => res.json(await backupNo
 app.get('/api/admin/backup', admin, (req, res) => res.json({ configured: !!(SBU() && SBK()), last: lastBackup, error: lastBackupError }));
 // Members: dry-run validation first, then import valid rows
 app.post('/api/admin/members', admin, async (req, res) => {
-  const rows = req.body.rows || [], errors = [], seenM = new Set(), seenId = new Set(), good = [];
+  const rows = req.body.rows || [], errors = [], seenM = new Set(), seenId = new Set(), good = [], preview = [], exist = new Set(db.prepare('SELECT member_id FROM members').all().map(x => x.member_id));
   rows.forEach((r, i) => {
     const row = i + 2, mob = norm(r.mobile), mid = String(r.member_id || '').trim(), em = String(r.email || '').trim(), bad = [];
     if (!mid) bad.push('Member ID missing'); else if (seenId.has(mid)) bad.push('Duplicate Member ID'); 
     if (mob.length !== 10 || !/^[6-9]/.test(mob)) bad.push('Invalid mobile'); else if (seenM.has(mob)) bad.push('Duplicate mobile');
     if (em && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(em)) bad.push('Invalid email');
-    if (bad.length) return errors.push({ row, member_id: mid, msg: bad.join(', ') });
+    const base = { row, member_id: mid, name: String(r.name || ''), mobile: mob || String(r.mobile || ''), email: em, category: String(r.category || '') };
+    if (bad.length) { preview.push({ ...base, status: 'error', msg: bad.join(', ') }); return errors.push({ row, member_id: mid, msg: bad.join(', ') }); }
+    preview.push({ ...base, status: exist.has(mid) ? 'update' : 'new' });
     seenId.add(mid); seenM.add(mob); good.push({ mid, name: r.name || '', mob, em, cat: r.category || '', el: /^(no|0|false|not)/i.test(String(r.eligible || 'yes').trim()) ? 0 : 1 });
   });
   if (!req.body.dry) {
@@ -143,7 +145,7 @@ app.post('/api/admin/members', admin, async (req, res) => {
     log(req, 'admin', 'MEMBER_UPLOAD', null, { imported: good.length, rejected: errors.length });
   }
   const saved = req.body.dry ? undefined : await saveToSupabase(req.body.filename, good, errors.length, req.body.file_b64);
-  res.json({ valid: good.length, errors, imported: !req.body.dry, saved });
+  res.json({ valid: good.length, errors, added: preview.filter(x => x.status === 'new').length, updated: preview.filter(x => x.status === 'update').length, preview: req.body.dry ? preview : undefined, imported: !req.body.dry, saved });
 });
 app.post('/api/admin/members/add', admin, (req, res) => {
   const mid = String(req.body.member_id || '').trim(), mob = norm(req.body.mobile), em = String(req.body.email || '').trim();
@@ -174,7 +176,7 @@ app.post('/api/admin/members/eligible', admin, (req, res) => {
 });
 app.get('/api/admin/members', admin, (req, res) => {
   const q = `%${req.query.q || ''}%`, p = Math.max(0, +req.query.page || 0);
-  const rows = db.prepare('SELECT member_id,name,mobile,email,eligible FROM members WHERE member_id LIKE ? OR name LIKE ? OR mobile LIKE ? OR email LIKE ? ORDER BY id DESC LIMIT 20 OFFSET ?').all(q, q, q, q, p * 20);
+  const rows = db.prepare('SELECT member_id,name,mobile,email,eligible FROM members WHERE member_id LIKE ? OR name LIKE ? OR mobile LIKE ? OR email LIKE ? ORDER BY id DESC LIMIT 20000').all(q, q, q, q);
   res.json({ rows, total: db.prepare('SELECT COUNT(*) c FROM members WHERE member_id LIKE ? OR name LIKE ? OR mobile LIKE ? OR email LIKE ?').get(q, q, q, q).c, uploads: db.prepare('SELECT * FROM uploads ORDER BY id DESC LIMIT 5').all() });
 });
 app.post('/api/admin/elections', admin, (req, res) => {
