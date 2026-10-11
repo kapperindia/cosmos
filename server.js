@@ -67,7 +67,7 @@ const norm = m => String(m || '').replace(/\D/g, '').slice(-10), hash = s => cry
 const status = e => { const n = Date.now(); if (e.locked) return 'LOCKED'; if (n < Date.parse(e.start_at)) return 'UPCOMING'; if (n <= Date.parse(e.end_at)) return 'OPEN'; return n >= Date.parse(e.result_at || e.end_at) ? 'RESULTS' : 'CLOSED'; };
 const hits = new Map(), limit = (n, ms) => (req, res, next) => { const k = req.ip + req.path, now = Date.now(), a = (hits.get(k) || []).filter(t => now - t < ms); a.push(now); hits.set(k, a); a.length > n ? res.status(429).json({ error: 'Too many attempts. Please try again later.' }) : next(); };
 const adminTokens = new Set(), sessions = new Map();
-const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '80mb' }));
+const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '80mb', verify: (req, res, buf) => { if (req.originalUrl.startsWith('/api/wa/webhook')) req.rawBody = buf; } }));
 // Mark the database "changed" after any successful write so the background job backs it up
 let dirty = false; app.use((req, res, next) => { if (req.method !== 'GET' && req.path.startsWith('/api/')) res.on('finish', () => { if (res.statusCode < 400) dirty = true; }); next(); });
 
@@ -289,7 +289,7 @@ app.post('/api/member/lookup', limit(10, 600000), (req, res) => {
   if (!m) { log(req, 'member', 'LOOKUP_NOT_FOUND', null, 'XXXXXX' + mobile.slice(-4)); return res.status(404).json({ error: 'This mobile number is not registered for this election.' }); }
   const elections = openStatus(m), all = db.prepare('SELECT * FROM elections').all().map(status);
   const state = !elections.length ? (all.includes('UPCOMING') ? 'not_started' : 'ended') : elections.every(e => e.voted) ? 'all_voted' : 'can_vote';
-  res.json({ name: m.name || 'Member', member_id: m.member_id, elections, state });
+  res.json({ name: m.name || 'Member', member_id: m.member_id, elections, state, wa: !!(process.env.WA_BUSINESS_NUMBER && process.env.WA_APP_SECRET) });
 });
 app.post('/api/otp/request', limit(6, 600000), async (req, res) => {
   const mobile = norm(req.body.mobile), m = db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile);
@@ -315,6 +315,56 @@ app.post('/api/otp/verify', limit(15, 600000), (req, res) => {
   if (!good) { db.prepare('UPDATE otps SET tries=tries+1 WHERE mobile=?').run(mobile); return res.status(400).json({ error: 'Incorrect OTP. Please try again.' }); }
   db.prepare('DELETE FROM otps WHERE mobile=?').run(mobile);
   const t = crypto.randomBytes(24).toString('hex'); sessions.set(t, { member_id: m.id, exp: Date.now() + 15 * 60000 }); res.json({ session: t, name: m.name });
+});
+// ---- WhatsApp reverse verification: the member SENDS a one-time code to the portal's WhatsApp number; WhatsApp tells us which number it came from ----
+// Needs the WhatsApp Business (Meta Cloud API) webhook. Env: WA_BUSINESS_NUMBER (e.g. 919876543210), WA_APP_SECRET, WA_VERIFY_TOKEN
+const waPending = new Map(), waByToken = new Map(), last10 = n => String(n || '').replace(/\D/g, '').slice(-10);
+setInterval(() => { for (const [c, p] of waPending) if (p.exp < Date.now()) { waPending.delete(c); waByToken.delete(p.token); } }, 60000).unref?.();
+const waReady = () => !!(process.env.WA_BUSINESS_NUMBER && process.env.WA_APP_SECRET);
+app.post('/api/wa/start', limit(6, 600000), (req, res) => {
+  if (!waReady()) return res.status(503).json({ error: 'WhatsApp verification is not set up yet. Please use the OTP option.' });
+  const mobile = norm(req.body.mobile), m = db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile);
+  if (!m) { log(req, 'member', 'WA_REJECTED_NOT_ELIGIBLE', null, 'XXXXXX' + mobile.slice(-4)); return res.status(403).json({ error: 'Mobile number is not registered for this election.' }); }
+  const ops = openStatus(m);
+  if (!ops.length) return res.status(400).json({ error: 'There is no election open for voting right now.' });
+  if (ops.every(e => e.voted)) { log(req, 'member:' + m.member_id, 'WA_BLOCKED_ALREADY_VOTED'); return res.status(400).json({ error: 'You have already voted. Voting is allowed only once.' }); }
+  for (const [c, p] of waPending) if (p.mobile === mobile) { waPending.delete(c); waByToken.delete(p.token); }
+  let code; do code = 'VOTE-' + crypto.randomInt(100000, 1000000); while (waPending.has(code));
+  const token = crypto.randomBytes(20).toString('hex'), ttl = 300;
+  waPending.set(code, { mobile, member_id: m.id, token, exp: Date.now() + ttl * 1000, verified: false }); waByToken.set(token, code);
+  log(req, 'member:' + m.member_id, 'WA_CODE_ISSUED');
+  res.json({ code, token, expires_in: ttl, link: `https://wa.me/${String(process.env.WA_BUSINESS_NUMBER).replace(/\D/g, '')}?text=${encodeURIComponent(code)}` });
+});
+app.get('/api/wa/status', limit(300, 600000), (req, res) => {
+  const code = waByToken.get(String(req.query.token || '')), p = code && waPending.get(code);
+  if (!p || p.exp < Date.now()) return res.json({ status: 'expired' });
+  if (!p.verified) return res.json({ status: 'waiting' });
+  const m = db.prepare('SELECT * FROM members WHERE id=? AND eligible=1').get(p.member_id);
+  waPending.delete(code); waByToken.delete(p.token);
+  if (!m) return res.json({ status: 'expired' });
+  const t = crypto.randomBytes(24).toString('hex'); sessions.set(t, { member_id: m.id, exp: Date.now() + 15 * 60000 });
+  log(req, 'member:' + m.member_id, 'WA_SESSION_STARTED'); res.json({ status: 'verified', session: t, name: m.name });
+});
+// Meta calls this once to confirm the webhook URL...
+app.get('/api/wa/webhook', (req, res) => {
+  if (req.query['hub.mode'] === 'subscribe' && process.env.WA_VERIFY_TOKEN && req.query['hub.verify_token'] === process.env.WA_VERIFY_TOKEN) return res.status(200).send(String(req.query['hub.challenge']));
+  res.sendStatus(403);
+});
+// ...and posts every incoming WhatsApp message here. Requests without a valid Meta signature are ignored.
+app.post('/api/wa/webhook', (req, res) => {
+  const secret = process.env.WA_APP_SECRET, sig = String(req.get('x-hub-signature-256') || '');
+  if (!secret || !req.rawBody) return res.sendStatus(403);
+  const want = 'sha256=' + crypto.createHmac('sha256', secret).update(req.rawBody).digest('hex');
+  if (sig.length !== want.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(want))) return res.sendStatus(403);
+  try {
+    for (const en of req.body.entry || []) for (const ch of en.changes || []) for (const msg of ch.value?.messages || []) {
+      const hit = String(msg.text?.body || '').toUpperCase().match(/VOTE-\d{6}/), p = hit && waPending.get(hit[0]);
+      if (!p || p.exp < Date.now() || p.verified) continue;
+      if (last10(msg.from) === p.mobile) { p.verified = true; log(req, 'member:' + p.member_id, 'WA_VERIFIED'); }
+      else log(req, 'member:' + p.member_id, 'WA_NUMBER_MISMATCH', null, 'sent from XXXXXX' + last10(msg.from).slice(-4));
+    }
+  } catch (e) { console.error('WA webhook error', e.message); }
+  res.sendStatus(200);
 });
 app.get('/api/ballot', voter, (req, res) => res.json({ elections: db.prepare('SELECT * FROM elections').all().map(view).filter(e => e.status === 'OPEN').map(e => ({ ...e, voted: !!db.prepare('SELECT 1 FROM voter_participation WHERE election_id=? AND member_id=?').get(e.id, req.member) })) }));
 app.post('/api/vote', voter, (req, res) => {
