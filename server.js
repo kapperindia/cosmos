@@ -67,7 +67,7 @@ const norm = m => String(m || '').replace(/\D/g, '').slice(-10), hash = s => cry
 const status = e => { const n = Date.now(); if (e.locked) return 'LOCKED'; if (n < Date.parse(e.start_at)) return 'UPCOMING'; if (n <= Date.parse(e.end_at)) return 'OPEN'; return n >= Date.parse(e.result_at || e.end_at) ? 'RESULTS' : 'CLOSED'; };
 const hits = new Map(), limit = (n, ms) => (req, res, next) => { const k = req.ip + req.path, now = Date.now(), a = (hits.get(k) || []).filter(t => now - t < ms); a.push(now); hits.set(k, a); a.length > n ? res.status(429).json({ error: 'Too many attempts. Please try again later.' }) : next(); };
 const adminTokens = new Set(), sessions = new Map();
-const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '12mb' }));
+const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '80mb' }));
 // Mark the database "changed" after any successful write so the background job backs it up
 let dirty = false; app.use((req, res, next) => { if (req.method !== 'GET' && req.path.startsWith('/api/')) res.on('finish', () => { if (res.statusCode < 400) dirty = true; }); next(); });
 
@@ -343,7 +343,7 @@ setInterval(async () => {
 // Always answer API problems with JSON (never an HTML error page), so the screens can show a clear message
 app.use('/api', (req, res) => res.status(404).json({ error: `Server is out of date: ${req.method} ${req.originalUrl.split('?')[0]} does not exist. Upload the latest server.js and redeploy.` }));
 app.use((err, req, res, next) => {
-  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'The file is too large to upload (limit about 8 MB).' });
+  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'The upload is too large. Files up to 20 MB are supported.' });
   if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'The upload was not valid. Please try again.' });
   console.error('ERROR', err); res.status(500).json({ error: 'Server error. Please try again.' });
 });
