@@ -1,5 +1,11 @@
 // Run: npm install && ADMIN_PASSWORD=xxx AUDIT_KEY=yyy npm start   (use behind HTTPS)
 const express = require('express'), { DatabaseSync } = require('node:sqlite'), crypto = require('crypto'), path = require('path'), fs = require('fs');  // node:sqlite is built into Node 22: no native build needed
+// Public (non-secret) COSMEX settings, so only the passwords need to be set in Hostinger. Hostinger environment variables, if set, override these.
+process.env.FIREBASE_PROJECT_ID ||= 'cosmex-e9ba2';
+process.env.FIREBASE_API_KEY ||= 'AIzaSyCSkPhbd6G7Eik_MoMrpsv9rxYsWdZXMpk';   // Firebase web API keys are public identifiers, not secrets
+process.env.FIREBASE_AUTH_DOMAIN ||= 'cosmex-e9ba2.firebaseapp.com';
+process.env.FIREBASE_DATABASE_URL ||= 'https://cosmex-e9ba2-default-rtdb.firebaseio.com';
+process.env.ORG_NAME ||= 'COSMEX';
 process.on('uncaughtException', e => console.error('FATAL', e)); process.on('unhandledRejection', e => console.error('UNHANDLED', e));
 const AUDIT_KEY = process.env.AUDIT_KEY || 'change-me-audit-key';
 const H = p => crypto.scryptSync(String(p), 'election-portal-v1', 32), AH = H(process.env.ADMIN_PASSWORD || 'admin123');
@@ -113,7 +119,7 @@ app.get(['/privacy', '/privacy-policy'], (req, res) => {
 <p>The portal records <i>that</i> you voted separately from <i>what</i> you chose. Ballots carry no member ID or time, so a vote cannot be linked back to a voter, not even by the Election Commissioner. Candidate-wise counts are shown only as the election rules allow.</p>
 <h2>5. Who can see your information</h2><ul>
 <li>The Election Commissioner and authorised officials can see the member register and the voted / yet-to-vote lists.</li>
-<li>Our service providers who run the portal: the web host, the SMS and WhatsApp message providers, and the cloud storage used for backups. They handle data only to provide these services.</li>
+<li>Our service providers who run the portal: the web host, the SMS and WhatsApp message providers, and the cloud services used for the member database and backups (Google Firebase and Supabase). They handle data only to provide these services.</li>
 <li>Authorities, where the law requires it.</li></ul>
 <h2>6. Storage, security and retention</h2>
 <p>Data is stored on secured servers and in private cloud storage. Access to commissioner functions needs a password. Backups are kept so records survive system changes. Because the association's elections must be verifiable, voting records, the audit log and uploaded member files are kept permanently and cannot be edited or deleted. Other member details are kept while you remain a member and as long as needed for the association's records.</p>
@@ -152,6 +158,60 @@ app.get('/api/admin/dashboard', admin, (req, res) => {
   const c = q => db.prepare(q).get().c, els = db.prepare('SELECT * FROM elections ORDER BY id').all().map(view);
   res.json({ members: c('SELECT COUNT(*) c FROM members'), eligible: c('SELECT COUNT(*) c FROM members WHERE eligible=1'), candidates: c('SELECT COUNT(*) c FROM candidates WHERE active=1'), active: els.filter(e => e.status === 'OPEN').length, completed: els.filter(e => ['CLOSED', 'RESULTS'].includes(e.status)).length, votes: c('SELECT COUNT(*) c FROM voter_participation'), elections: els });
 });
+
+// ---- Firebase Realtime Database: the uploaded member data lives at /members/<member ID> (member ID is the key). SQLite keeps a working copy for voting records. ----
+// Env: FIREBASE_DATABASE_URL + (FIREBASE_SERVICE_ACCOUNT = service-account JSON  OR  FIREBASE_DB_SECRET = legacy database secret)
+const rtdbReady = () => !!(process.env.FIREBASE_DATABASE_URL && (process.env.FIREBASE_DB_SECRET || process.env.FIREBASE_SERVICE_ACCOUNT));
+const fbKey = id => String(id).replace(/[.$#\[\]\/]/g, '_');
+let fbTok = { t: '', exp: 0 };
+async function fbAccessToken() {
+  if (fbTok.exp > Date.now() + 60000) return fbTok.t;
+  const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT), now = Math.floor(Date.now() / 1000), b = o => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const head = b({ alg: 'RS256', typ: 'JWT' }), body = b({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 });
+  const jwt = head + '.' + body + '.' + crypto.createSign('RSA-SHA256').update(head + '.' + body).sign(String(sa.private_key).replace(/\\n/g, '\n')).toString('base64url');
+  const r = await fetch(process.env.FIREBASE_TOKEN_URL || 'https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + jwt });
+  const d = await r.json(); if (!r.ok || !d.access_token) throw new Error('Firebase sign-in failed: ' + (d.error_description || d.error || r.status));
+  fbTok = { t: d.access_token, exp: Date.now() + (d.expires_in || 3600) * 1000 }; return fbTok.t;
+}
+async function rtdb(method, pathq, body) {
+  const auth = process.env.FIREBASE_DB_SECRET ? 'auth=' + encodeURIComponent(process.env.FIREBASE_DB_SECRET) : 'access_token=' + await fbAccessToken();
+  const r = await fetch(`${process.env.FIREBASE_DATABASE_URL.replace(/\/$/, '')}/${pathq}${pathq.includes('?') ? '&' : '?'}${auth}`, { method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const d = await r.json().catch(() => null); if (!r.ok) throw new Error((d && d.error) || 'Firebase database error ' + r.status); return d;
+}
+const fbVal = (mid, name, mobile, email, category, eligible) => ({ member_id: String(mid), name: name || '', mobile, email: email || '', category: category || '', eligible: !!eligible, updated_at: new Date().toISOString() });
+async function fbPushMany(map) { const keys = Object.keys(map); for (let i = 0; i < keys.length; i += 1000) { const part = {}; for (const k of keys.slice(i, i + 1000)) part[k] = map[k]; await rtdb('PATCH', 'members.json', part); } return keys.length; }
+// Copy one record from Firebase into the local working database (used for voting records)
+function upsertLocal(v) {
+  const mob = norm(v.mobile), mid = String(v.member_id || '').trim(); if (!mid || mob.length !== 10) return null;
+  const el = v.eligible === false ? 0 : 1, ex = db.prepare('SELECT id FROM members WHERE member_id=?').get(mid);
+  try {
+    if (ex) db.prepare('UPDATE members SET name=?,mobile=?,email=?,category=?,eligible=? WHERE id=?').run(v.name || '', mob, v.email || '', v.category || '', el, ex.id);
+    else db.prepare('INSERT INTO members(member_id,name,mobile,email,category,eligible) VALUES(?,?,?,?,?,?)').run(mid, v.name || '', mob, v.email || '', v.category || '', el);
+  } catch (e) { console.error('Could not copy member', mid, e.message); return null; }
+  return db.prepare('SELECT * FROM members WHERE member_id=?').get(mid);
+}
+// The phone number is checked against the uploaded data in Firebase (falls back to the local copy if Firebase is unreachable)
+async function findMember(mobile) {
+  if (rtdbReady()) {
+    try {
+      const d = await rtdb('GET', `members.json?orderBy=${encodeURIComponent('"mobile"')}&equalTo=${encodeURIComponent(JSON.stringify(mobile))}`), v = d && Object.values(d)[0];
+      if (!v) return null; const m = upsertLocal(v); return m && m.eligible ? m : null;
+    } catch (e) { console.error('Firebase lookup failed, using local copy:', e.message); }
+  }
+  return db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile) || null;
+}
+async function pullMembers() { const d = await rtdb('GET', 'members.json') || {}; let n = 0, skipped = 0; for (const v of Object.values(d)) (upsertLocal(v) ? n++ : skipped++); return { pulled: n, skipped }; }
+async function pushAllMembers() { const map = {}; for (const m of db.prepare('SELECT * FROM members').all()) map[fbKey(m.member_id)] = fbVal(m.member_id, m.name, m.mobile, m.email, m.category, m.eligible); return { pushed: await fbPushMany(map) }; }
+async function saveToFirebase(filename, good, rejected) {
+  if (!rtdbReady()) return { skipped: 'Firebase database is not configured.' };
+  try {
+    const map = {}; for (const g of good) map[fbKey(g.mid)] = fbVal(g.mid, g.name, g.mob, g.em, g.cat, g.el);
+    const n = await fbPushMany(map), at = new Date().toISOString();
+    await rtdb('PUT', `uploads/${Date.now()}.json`, { filename: filename || 'unnamed', uploaded_at: at, rows: n, rejected });
+    return { saved: n, uploaded_at: at };
+  } catch (e) { return { error: 'Could not save to Firebase: ' + e.message }; }
+}
+const fbTry = async f => { if (!rtdbReady()) return undefined; try { await f(); return undefined; } catch (e) { console.error('Firebase sync failed:', e.message); return e.message; } };
 
 // ---- Supabase helpers (optional; need SUPABASE_URL + SUPABASE_SERVICE_KEY) ----
 const SBU = () => (process.env.SUPABASE_URL || '').replace(/\/$/, ''), SBK = () => process.env.SUPABASE_SERVICE_KEY || '';
@@ -217,9 +277,10 @@ app.post('/api/admin/members', admin, async (req, res) => {
     log(req, 'admin', 'MEMBER_UPLOAD', null, { imported: good.length, rejected: errors.length });
   }
   const saved = req.body.dry ? undefined : await saveToSupabase(req.body.filename, good, errors.length, req.body.file_b64);
-  res.json({ valid: good.length, errors, added: preview.filter(x => x.status === 'new').length, updated: preview.filter(x => x.status === 'update').length, preview: req.body.dry ? preview : undefined, imported: !req.body.dry, saved });
+  const firebase = req.body.dry ? undefined : await saveToFirebase(req.body.filename, good, errors.length);
+  res.json({ valid: good.length, errors, added: preview.filter(x => x.status === 'new').length, updated: preview.filter(x => x.status === 'update').length, preview: req.body.dry ? preview : undefined, imported: !req.body.dry, saved, firebase });
 });
-app.post('/api/admin/members/add', admin, (req, res) => {
+app.post('/api/admin/members/add', admin, async (req, res) => {
   const mid = String(req.body.member_id || '').trim(), mob = norm(req.body.mobile), em = String(req.body.email || '').trim();
   if (!mid) return res.status(400).json({ error: 'Member ID is required.' });
   if (mob.length !== 10 || !/^[6-9]/.test(mob)) return res.status(400).json({ error: 'Enter a valid 10-digit mobile number.' });
@@ -228,9 +289,10 @@ app.post('/api/admin/members/add', admin, (req, res) => {
   if (db.prepare('SELECT 1 FROM members WHERE mobile=?').get(mob)) return res.status(400).json({ error: 'This mobile number already belongs to another member.' });
   db.prepare('INSERT INTO members(member_id,name,mobile,email,category,eligible) VALUES(?,?,?,?,?,1)').run(mid, String(req.body.name || '').trim(), mob, em, String(req.body.category || '').trim());
   log(req, 'admin', 'MEMBER_ADD', null, { member_id: mid });
-  res.json({ ok: true });
+  const fb_error = await fbTry(() => rtdb('PUT', `members/${encodeURIComponent(fbKey(mid))}.json`, fbVal(mid, String(req.body.name || '').trim(), mob, em, String(req.body.category || '').trim(), 1)));
+  res.json({ ok: true, fb_error });
 });
-app.post('/api/admin/members/remove', admin, (req, res) => {
+app.post('/api/admin/members/remove', admin, async (req, res) => {
   const mid = String(req.body.member_id || '').trim(), m = db.prepare('SELECT * FROM members WHERE member_id=?').get(mid);
   if (!m) return res.status(404).json({ error: 'Member not found.' });
   if (db.prepare('SELECT 1 FROM voter_participation WHERE member_id=?').get(m.id))
@@ -238,13 +300,15 @@ app.post('/api/admin/members/remove', admin, (req, res) => {
   db.prepare('DELETE FROM otps WHERE mobile=?').run(m.mobile);
   db.prepare('DELETE FROM members WHERE id=?').run(m.id);
   log(req, 'admin', 'MEMBER_REMOVE', null, { member_id: mid });
-  res.json({ ok: true });
+  const fb_error = await fbTry(() => rtdb('DELETE', `members/${encodeURIComponent(fbKey(mid))}.json`));
+  res.json({ ok: true, fb_error });
 });
-app.post('/api/admin/members/eligible', admin, (req, res) => {
+app.post('/api/admin/members/eligible', admin, async (req, res) => {
   const mid = String(req.body.member_id || '').trim(), v = req.body.eligible ? 1 : 0;
   if (!db.prepare('UPDATE members SET eligible=? WHERE member_id=? RETURNING id').get(v, mid)) return res.status(404).json({ error: 'Member not found.' });
   log(req, 'admin', v ? 'MEMBER_ELIGIBLE' : 'MEMBER_INELIGIBLE', null, { member_id: mid });
-  res.json({ ok: true });
+  const fb_error = await fbTry(() => rtdb('PATCH', `members/${encodeURIComponent(fbKey(mid))}.json`, { eligible: !!v, updated_at: new Date().toISOString() }));
+  res.json({ ok: true, fb_error });
 });
 app.get('/api/admin/members', admin, (req, res) => {
   const q = `%${req.query.q || ''}%`, p = Math.max(0, +req.query.page || 0);
@@ -288,6 +352,13 @@ app.post('/api/admin/notices', admin, (req, res) => { if (!req.body.message) ret
 app.get('/api/admin/notices', admin, (req, res) => res.json(db.prepare(`SELECT n.id,n.message,n.send_at,n.sent,(SELECT COUNT(*) FROM notification_logs WHERE notice_id=n.id AND status='SENT') ok,(SELECT COUNT(*) FROM notification_logs WHERE notice_id=n.id AND status='FAILED') failed FROM notices n ORDER BY id DESC LIMIT 10`).all()));
 // Restricted audit mode: key + written reason, always logged. Ballots cannot be linked to voters by design.
 // Voted / yet-to-vote lists (who participated, never whom they voted for)
+app.get('/api/admin/firebase', admin, async (req, res) => {
+  if (!rtdbReady()) return res.json({ configured: false });
+  try { const k = await rtdb('GET', 'members.json?shallow=true'); res.json({ configured: true, in_firebase: Object.keys(k || {}).length, local: db.prepare('SELECT COUNT(*) c FROM members').get().c }); }
+  catch (e) { res.json({ configured: true, error: e.message }); }
+});
+app.post('/api/admin/firebase/push', admin, async (req, res) => { try { const r = await pushAllMembers(); log(req, 'admin', 'FIREBASE_PUSH', null, r); res.json({ ok: true, ...r }); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.post('/api/admin/firebase/pull', admin, async (req, res) => { try { const r = await pullMembers(); log(req, 'admin', 'FIREBASE_PULL', null, r); res.json({ ok: true, ...r }); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get('/api/admin/participation/:id', admin, (req, res) => {
   const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id); if (!e) return res.status(404).json({ error: 'Election not found.' });
   const voted = db.prepare('SELECT m.member_id,m.name,m.mobile,m.category,p.voted_at FROM voter_participation p JOIN members m ON m.id=p.member_id WHERE p.election_id=? ORDER BY p.voted_at DESC').all(e.id);
@@ -338,8 +409,8 @@ app.get('/api/results/:id', (req, res) => {
 // ================= OTP + voting =================
 const cfg = () => db.prepare('SELECT * FROM elections').all().find(e => status(e) === 'OPEN') || { otp_ttl: 300, max_attempts: 5 };
 const openStatus = m => db.prepare('SELECT * FROM elections').all().filter(e => status(e) === 'OPEN').map(e => ({ id: e.id, code: e.code, post: e.post, voted: !!db.prepare('SELECT 1 FROM voter_participation WHERE election_id=? AND member_id=?').get(e.id, m.id) }));
-app.post('/api/member/lookup', limit(10, 600000), (req, res) => {
-  const mobile = norm(req.body.mobile), m = db.prepare('SELECT id,name,member_id FROM members WHERE mobile=? AND eligible=1').get(mobile);
+app.post('/api/member/lookup', limit(10, 600000), async (req, res) => {
+  const mobile = norm(req.body.mobile), m = await findMember(mobile);
   if (!m) { log(req, 'member', 'LOOKUP_NOT_FOUND', null, 'XXXXXX' + mobile.slice(-4)); return res.status(404).json({ error: 'This mobile number is not registered for this election.' }); }
   const elections = openStatus(m), all = db.prepare('SELECT * FROM elections').all().map(status);
   const state = !elections.length ? (all.includes('UPCOMING') ? 'not_started' : 'ended') : elections.every(e => e.voted) ? 'all_voted' : 'can_vote';
@@ -348,7 +419,7 @@ app.post('/api/member/lookup', limit(10, 600000), (req, res) => {
 app.post('/api/otp/request', limit(6, 600000), async (req, res) => {
   const ch = req.body.channel === 'whatsapp' ? 'whatsapp' : 'sms';
   if (ch === 'whatsapp' && !waOtpReady()) return res.status(503).json({ error: 'OTP on WhatsApp is not set up yet. Please use the SMS OTP.' });
-  const mobile = norm(req.body.mobile), m = db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile);
+  const mobile = norm(req.body.mobile), m = await findMember(mobile);
   if (!m) { log(req, 'member', 'OTP_REJECTED_NOT_ELIGIBLE', null, 'XXXXXX' + mobile.slice(-4)); return res.status(403).json({ error: 'Mobile number is not registered for this election.' }); }
   const els = db.prepare('SELECT * FROM elections').all().map(status), ops = openStatus(m);
   if (ops.length && ops.every(e => e.voted)) { log(req, 'member:' + m.member_id, 'OTP_BLOCKED_ALREADY_VOTED'); return res.status(400).json({ error: 'You have already voted. Voting is allowed only once, so no OTP will be sent.' }); }
@@ -379,9 +450,9 @@ app.post('/api/otp/verify', limit(15, 600000), (req, res) => {
 const waPending = new Map(), waByToken = new Map(), last10 = n => String(n || '').replace(/\D/g, '').slice(-10);
 setInterval(() => { for (const [c, p] of waPending) if (p.exp < Date.now()) { waPending.delete(c); waByToken.delete(p.token); } }, 60000).unref?.();
 const waReady = () => !!(process.env.WA_BUSINESS_NUMBER && process.env.WA_APP_SECRET);
-app.post('/api/wa/start', limit(6, 600000), (req, res) => {
+app.post('/api/wa/start', limit(6, 600000), async (req, res) => {
   if (!waReady()) return res.status(503).json({ error: 'WhatsApp verification is not set up yet. Please use the OTP option.' });
-  const mobile = norm(req.body.mobile), m = db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile);
+  const mobile = norm(req.body.mobile), m = await findMember(mobile);
   if (!m) { log(req, 'member', 'WA_REJECTED_NOT_ELIGIBLE', null, 'XXXXXX' + mobile.slice(-4)); return res.status(403).json({ error: 'Mobile number is not registered for this election.' }); }
   const ops = openStatus(m);
   if (!ops.length) return res.status(400).json({ error: 'There is no election open for voting right now.' });
@@ -450,7 +521,7 @@ app.post('/api/firebase/verify', limit(10, 600000), async (req, res) => {
     for (const [k, e] of fbUsed) if (e < Date.now()) fbUsed.delete(k);
     if (fbUsed.has(tid)) throw new Error('This sign-in was already used');
     if (pl.firebase?.sign_in_provider !== 'phone' || !pl.phone_number || last10(pl.phone_number) !== mobile) { log(req, 'member', 'FIREBASE_NUMBER_MISMATCH', null, 'XXXXXX' + mobile.slice(-4)); throw new Error('The verified phone number does not match.'); }
-    const m = db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile);
+    const m = await findMember(mobile);
     if (!m) { log(req, 'member', 'FIREBASE_REJECTED_NOT_ELIGIBLE', null, 'XXXXXX' + mobile.slice(-4)); return res.status(403).json({ error: 'Mobile number is not registered for this election.' }); }
     const ops = openStatus(m);
     if (!ops.length) return res.status(400).json({ error: 'There is no election open for voting right now.' });
@@ -492,3 +563,5 @@ app.use((err, req, res, next) => {
   console.error('ERROR', err); res.status(500).json({ error: 'Server error. Please try again.' });
 });
 app.listen(process.env.PORT || 3000, () => console.log('Election portal listening on', process.env.PORT || 3000, 'db:', DB_FILE));
+// On start: load members from Firebase (so they survive redeploys); if Firebase has none yet, send the local ones up
+if (rtdbReady()) setTimeout(async () => { try { const k = await rtdb('GET', 'members.json?shallow=true'); if (k && Object.keys(k).length) console.log('Members loaded from Firebase:', await pullMembers()); else if (db.prepare('SELECT COUNT(*) c FROM members').get().c) console.log('Members sent to Firebase:', await pushAllMembers()); } catch (e) { console.error('Firebase start-up sync failed:', e.message); } }, 1500);
