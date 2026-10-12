@@ -61,6 +61,15 @@ const log = (req, actor, action, eid, detail) => {
 };
 // ---- SMS / email: plug in your provider (MSG91, Twilio, SES, SMTP). Return true on success. ----
 const sendSms = async (mobile, text) => { console.log(`[SMS ${mobile}] ${text}`); return true; };
+// WhatsApp OTP delivery (WhatsApp Cloud API, approved "authentication" template). Env: WA_ACCESS_TOKEN, WA_PHONE_NUMBER_ID, WA_OTP_TEMPLATE; optional WA_OTP_LANG (default en), WA_COUNTRY_CODE (default 91)
+const waOtpReady = () => !!(process.env.WA_ACCESS_TOKEN && process.env.WA_PHONE_NUMBER_ID && process.env.WA_OTP_TEMPLATE);
+async function sendWhatsAppOtp(mobile, otp) {
+  try {
+    const r = await fetch(`${process.env.WA_GRAPH_URL || 'https://graph.facebook.com/v21.0'}/${process.env.WA_PHONE_NUMBER_ID}/messages`, { method: 'POST', headers: { Authorization: 'Bearer ' + process.env.WA_ACCESS_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify({ messaging_product: 'whatsapp', to: (process.env.WA_COUNTRY_CODE || '91') + mobile, type: 'template', template: { name: process.env.WA_OTP_TEMPLATE, language: { code: process.env.WA_OTP_LANG || 'en' }, components: [{ type: 'body', parameters: [{ type: 'text', text: otp }] }, { type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: otp }] }] } }) });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); console.error('WhatsApp OTP failed', r.status, d.error?.message || ''); return false; }
+    return true;
+  } catch (e) { console.error('WhatsApp OTP error', e.message); return false; }
+}
 const sendEmail = async (to, subject, text) => { if (!to) return false; console.log(`[EMAIL ${to}] ${subject}: ${text}`); return true; };
 
 const norm = m => String(m || '').replace(/\D/g, '').slice(-10), hash = s => crypto.createHash('sha256').update(s).digest('hex');
@@ -73,6 +82,46 @@ let dirty = false; app.use((req, res, next) => { if (req.method !== 'GET' && req
 
 app.use((req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:" }); next(); });
 app.get('/health', (_, res) => res.send('ok'));
+// Public privacy policy page (required by WhatsApp/Meta and good practice). Set ORG_NAME and CONTACT_EMAIL in the host's environment variables.
+const escH = x => String(x).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+app.get(['/privacy', '/privacy-policy'], (req, res) => {
+  const org = escH(process.env.ORG_NAME || 'COSMEX'), mail = escH(process.env.CONTACT_EMAIL || 'the Election Commissioner'), upd = '12 October 2026';
+  res.type('html').send(`<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Privacy Policy - ${org} Online Election Portal</title>
+<style>body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:0;background:#f4f6fb;color:#14213d;line-height:1.6}main{max-width:780px;margin:0 auto;padding:24px 18px 60px}h1{font-size:30px;margin:8px 0}h2{font-size:20px;margin:28px 0 6px}a{color:#0b2a6f}.top{background:#0e1a4a;color:#fff;padding:14px 18px}.top a{color:#fff;text-decoration:none;font-weight:700}li{margin:4px 0}.mut{color:#5b6679}@media(prefers-color-scheme:dark){body{background:#0f1424;color:#eef1fa}a{color:#8fb0ff}.mut{color:#9aa6bf}}</style></head><body>
+<div class="top"><a href="/">&larr; ${org} Online Election Portal</a></div><main>
+<h1>Privacy Policy</h1><p class="mut">Last updated: ${upd}</p>
+<p>This policy explains how the ${org} Online Election Portal ("the portal") collects, uses and protects personal information when registered members vote in elections run by ${org} ("we", "the association").</p>
+<h2>1. Information we collect</h2><ul>
+<li><b>Member register details</b> supplied by the association: member ID, name, mobile number, email address (if provided) and category.</li>
+<li><b>Voting records:</b> whether you have voted in each election and when. Your choice of candidate is stored separately (see section 4).</li>
+<li><b>Verification data:</b> a one-time password (stored only in scrambled form and deleted after use or expiry), or, if you choose WhatsApp verification, the WhatsApp number that sends us the verification code.</li>
+<li><b>Security logs:</b> actions taken on the portal (for example OTP requests, votes cast, commissioner actions) with the time and IP address, to detect misuse.</li></ul>
+<h2>2. How we use it</h2><ul>
+<li>To confirm you are a registered member and are allowed to vote.</li>
+<li>To send you a one-time password by SMS, or verify you through WhatsApp, and to send election notices.</li>
+<li>To make sure each member votes only once, to count votes, to show turnout and results, and to give the Election Commissioner voter and yet-to-vote lists.</li>
+<li>To keep election records that can be checked later if a question is raised.</li></ul>
+<p>We do not sell your information, use it for advertising, or share it for marketing.</p>
+<h2>3. WhatsApp verification</h2>
+<p>If you choose "Verify with WhatsApp", you send a one-time code from your own WhatsApp to the association's WhatsApp number. WhatsApp (Meta) tells us the number the message came from, and we use it only to confirm that it matches your registered mobile number. We do not read your other chats, contacts or profile, and we do not use the number for anything else. WhatsApp's own use of data is governed by Meta's privacy policy.</p>
+<h2>4. Secrecy of your vote</h2>
+<p>The portal records <i>that</i> you voted separately from <i>what</i> you chose. Ballots carry no member ID or time, so a vote cannot be linked back to a voter, not even by the Election Commissioner. Candidate-wise counts are shown only as the election rules allow.</p>
+<h2>5. Who can see your information</h2><ul>
+<li>The Election Commissioner and authorised officials can see the member register and the voted / yet-to-vote lists.</li>
+<li>Our service providers who run the portal: the web host, the SMS and WhatsApp message providers, and the cloud storage used for backups. They handle data only to provide these services.</li>
+<li>Authorities, where the law requires it.</li></ul>
+<h2>6. Storage, security and retention</h2>
+<p>Data is stored on secured servers and in private cloud storage. Access to commissioner functions needs a password. Backups are kept so records survive system changes. Because the association's elections must be verifiable, voting records, the audit log and uploaded member files are kept permanently and cannot be edited or deleted. Other member details are kept while you remain a member and as long as needed for the association's records.</p>
+<h2>7. Cookies and tracking</h2>
+<p>The portal does not use advertising cookies or third-party trackers.</p>
+<h2>8. Your choices and rights</h2>
+<p>You may ask to see the information we hold about you, to correct wrong details (such as your mobile number or email), or to ask questions about how it is used. Election records already created cannot be erased, as explained above. Contact us at the address below.</p>
+<h2>9. Children</h2><p>The portal is for adult members of the association and is not intended for children.</p>
+<h2>10. Changes to this policy</h2><p>If we change this policy, the new version will be posted on this page with a new date.</p>
+<h2>11. Contact</h2><p>For privacy questions or requests, contact: <b>${mail}</b> (${org} Election Commissioner).</p>
+</main></body></html>`);
+});
+
 // Works whether index.html sits in ./public/ or in the repo root (only index.html is ever served from the root, never server.js or the database)
 const PUB = path.join(__dirname, 'public'), HOME = [path.join(PUB, 'index.html'), path.join(__dirname, 'index.html')].find(f => fs.existsSync(f));
 if (fs.existsSync(PUB)) app.use(express.static(PUB));
@@ -289,9 +338,11 @@ app.post('/api/member/lookup', limit(10, 600000), (req, res) => {
   if (!m) { log(req, 'member', 'LOOKUP_NOT_FOUND', null, 'XXXXXX' + mobile.slice(-4)); return res.status(404).json({ error: 'This mobile number is not registered for this election.' }); }
   const elections = openStatus(m), all = db.prepare('SELECT * FROM elections').all().map(status);
   const state = !elections.length ? (all.includes('UPCOMING') ? 'not_started' : 'ended') : elections.every(e => e.voted) ? 'all_voted' : 'can_vote';
-  res.json({ name: m.name || 'Member', member_id: m.member_id, elections, state, wa: !!(process.env.WA_BUSINESS_NUMBER && process.env.WA_APP_SECRET) });
+  res.json({ name: m.name || 'Member', member_id: m.member_id, elections, state, wa: !!(process.env.WA_BUSINESS_NUMBER && process.env.WA_APP_SECRET), wa_otp: waOtpReady() });
 });
 app.post('/api/otp/request', limit(6, 600000), async (req, res) => {
+  const ch = req.body.channel === 'whatsapp' ? 'whatsapp' : 'sms';
+  if (ch === 'whatsapp' && !waOtpReady()) return res.status(503).json({ error: 'OTP on WhatsApp is not set up yet. Please use the SMS OTP.' });
   const mobile = norm(req.body.mobile), m = db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile);
   if (!m) { log(req, 'member', 'OTP_REJECTED_NOT_ELIGIBLE', null, 'XXXXXX' + mobile.slice(-4)); return res.status(403).json({ error: 'Mobile number is not registered for this election.' }); }
   const els = db.prepare('SELECT * FROM elections').all().map(status), ops = openStatus(m);
@@ -302,8 +353,10 @@ app.post('/api/otp/request', limit(6, 600000), async (req, res) => {
   if (o && o.resends >= 5 && Date.now() - o.sent_at < 3600000) return res.status(429).json({ error: 'Too many OTP requests. Please try again later.' });
   const otp = String(crypto.randomInt(100000, 1000000));
   db.prepare('INSERT OR REPLACE INTO otps(mobile,hash,expires,tries,sent_at,resends) VALUES(?,?,?,0,?,?)').run(mobile, hash(otp), Date.now() + cfg().otp_ttl * 1000, Date.now(), (o?.resends || 0) + 1);
-  await sendSms(mobile, `Your election OTP is ${otp}. Valid for ${Math.round(cfg().otp_ttl / 60)} minutes. Do not share it.`);
-  log(req, 'member:' + m.member_id, 'OTP_GENERATED'); res.json({ ok: true });
+  if (ch === 'whatsapp') {
+    if (!await sendWhatsAppOtp(mobile, otp)) { db.prepare('DELETE FROM otps WHERE mobile=?').run(mobile); log(req, 'member:' + m.member_id, 'OTP_WHATSAPP_FAILED'); return res.status(502).json({ error: 'Could not send the OTP on WhatsApp right now. Please try the SMS OTP or WhatsApp verification.' }); }
+  } else await sendSms(mobile, `Your election OTP is ${otp}. Valid for ${Math.round(cfg().otp_ttl / 60)} minutes. Do not share it.`);
+  log(req, 'member:' + m.member_id, 'OTP_GENERATED', null, ch); res.json({ ok: true, channel: ch });
 });
 app.post('/api/otp/verify', limit(15, 600000), (req, res) => {
   const mobile = norm(req.body.mobile), o = db.prepare('SELECT * FROM otps WHERE mobile=?').get(mobile), m = db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile);
