@@ -80,7 +80,12 @@ const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: 
 // Mark the database "changed" after any successful write so the background job backs it up
 let dirty = false; app.use((req, res, next) => { if (req.method !== 'GET' && req.path.startsWith('/api/')) res.on('finish', () => { if (res.statusCode < 400) dirty = true; }); next(); });
 
-app.use((req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:" }); next(); });
+// Content-Security-Policy. When Firebase sign-in is configured, only Google's Firebase/reCAPTCHA hosts are additionally allowed.
+const fbConfig = () => process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_API_KEY ? { apiKey: process.env.FIREBASE_API_KEY, authDomain: process.env.FIREBASE_AUTH_DOMAIN || process.env.FIREBASE_PROJECT_ID + '.firebaseapp.com', projectId: process.env.FIREBASE_PROJECT_ID, cc: process.env.FIREBASE_COUNTRY_CODE || '91' } : null;
+const CSP = fbConfig()
+  ? `default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' https://www.gstatic.com https://www.google.com https://apis.google.com; img-src 'self' data: https://www.gstatic.com https://www.google.com; frame-src https://www.google.com https://recaptcha.google.com https://${fbConfig().authDomain}; connect-src 'self' https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://www.googleapis.com https://firebaseinstallations.googleapis.com https://www.google.com`
+  : "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:";
+app.use((req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': CSP }); next(); });
 app.get('/health', (_, res) => res.send('ok'));
 // Public privacy policy page (required by WhatsApp/Meta and good practice). Set ORG_NAME and CONTACT_EMAIL in the host's environment variables.
 const escH = x => String(x).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -338,7 +343,7 @@ app.post('/api/member/lookup', limit(10, 600000), (req, res) => {
   if (!m) { log(req, 'member', 'LOOKUP_NOT_FOUND', null, 'XXXXXX' + mobile.slice(-4)); return res.status(404).json({ error: 'This mobile number is not registered for this election.' }); }
   const elections = openStatus(m), all = db.prepare('SELECT * FROM elections').all().map(status);
   const state = !elections.length ? (all.includes('UPCOMING') ? 'not_started' : 'ended') : elections.every(e => e.voted) ? 'all_voted' : 'can_vote';
-  res.json({ name: m.name || 'Member', member_id: m.member_id, elections, state, wa: !!(process.env.WA_BUSINESS_NUMBER && process.env.WA_APP_SECRET), wa_otp: waOtpReady() });
+  res.json({ name: m.name || 'Member', member_id: m.member_id, elections, state, wa: !!(process.env.WA_BUSINESS_NUMBER && process.env.WA_APP_SECRET), wa_otp: waOtpReady(), fb: fbConfig() });
 });
 app.post('/api/otp/request', limit(6, 600000), async (req, res) => {
   const ch = req.body.channel === 'whatsapp' ? 'whatsapp' : 'sms';
@@ -418,6 +423,42 @@ app.post('/api/wa/webhook', (req, res) => {
     }
   } catch (e) { console.error('WA webhook error', e.message); }
   res.sendStatus(200);
+});
+// ---- Firebase Authentication (Phone / SMS OTP). The browser signs in with Firebase; here we verify Google's signed ID token and match the phone number to the member ----
+let fbCerts = { exp: 0, keys: {} }; const fbUsed = new Map();
+async function fbKeys() {
+  if (Date.now() < fbCerts.exp) return fbCerts.keys;
+  const r = await fetch(process.env.FIREBASE_CERTS_URL || 'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com');
+  if (!r.ok) throw new Error('Could not fetch Google signing keys');
+  const m = /max-age=(\d+)/.exec(r.headers.get('cache-control') || ''); fbCerts = { keys: await r.json(), exp: Date.now() + (m ? +m[1] : 3600) * 1000 };
+  return fbCerts.keys;
+}
+async function verifyFirebaseToken(idToken) {
+  const [h, p, sig] = String(idToken || '').split('.'); if (!sig) throw new Error('Malformed token');
+  const header = JSON.parse(Buffer.from(h, 'base64url')), pl = JSON.parse(Buffer.from(p, 'base64url')), cert = (await fbKeys())[header.kid], pid = process.env.FIREBASE_PROJECT_ID, now = Date.now() / 1000;
+  if (header.alg !== 'RS256' || !cert) throw new Error('Unknown signing key');
+  if (!crypto.createVerify('RSA-SHA256').update(h + '.' + p).verify(cert, Buffer.from(sig, 'base64url'))) throw new Error('Bad signature');
+  if (pl.aud !== pid || pl.iss !== 'https://securetoken.google.com/' + pid) throw new Error('Token is for a different project');
+  if (!(pl.exp > now) || pl.iat > now + 60 || !pl.sub) throw new Error('Token expired');
+  if (now - (pl.auth_time || 0) > 300) throw new Error('Sign-in is too old');
+  return pl;
+}
+app.post('/api/firebase/verify', limit(10, 600000), async (req, res) => {
+  if (!fbConfig()) return res.status(503).json({ error: 'Firebase sign-in is not set up yet. Please use another option.' });
+  try {
+    const pl = await verifyFirebaseToken(req.body.idToken), mobile = norm(req.body.mobile), tid = crypto.createHash('sha256').update(String(req.body.idToken)).digest('hex');
+    for (const [k, e] of fbUsed) if (e < Date.now()) fbUsed.delete(k);
+    if (fbUsed.has(tid)) throw new Error('This sign-in was already used');
+    if (pl.firebase?.sign_in_provider !== 'phone' || !pl.phone_number || last10(pl.phone_number) !== mobile) { log(req, 'member', 'FIREBASE_NUMBER_MISMATCH', null, 'XXXXXX' + mobile.slice(-4)); throw new Error('The verified phone number does not match.'); }
+    const m = db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile);
+    if (!m) { log(req, 'member', 'FIREBASE_REJECTED_NOT_ELIGIBLE', null, 'XXXXXX' + mobile.slice(-4)); return res.status(403).json({ error: 'Mobile number is not registered for this election.' }); }
+    const ops = openStatus(m);
+    if (!ops.length) return res.status(400).json({ error: 'There is no election open for voting right now.' });
+    if (ops.every(e => e.voted)) { log(req, 'member:' + m.member_id, 'FIREBASE_BLOCKED_ALREADY_VOTED'); return res.status(400).json({ error: 'You have already voted. Voting is allowed only once.' }); }
+    fbUsed.set(tid, Date.now() + 600000);
+    const t = crypto.randomBytes(24).toString('hex'); sessions.set(t, { member_id: m.id, exp: Date.now() + 15 * 60000 });
+    log(req, 'member:' + m.member_id, 'FIREBASE_SESSION_STARTED'); res.json({ session: t, name: m.name });
+  } catch (e) { log(req, 'member', 'FIREBASE_VERIFY_FAILED', null, String(e.message).slice(0, 80)); res.status(401).json({ error: 'Could not verify your phone number. Please try again.' }); }
 });
 app.get('/api/ballot', voter, (req, res) => res.json({ elections: db.prepare('SELECT * FROM elections').all().map(view).filter(e => e.status === 'OPEN').map(e => ({ ...e, voted: !!db.prepare('SELECT 1 FROM voter_participation WHERE election_id=? AND member_id=?').get(e.id, req.member) })) }));
 app.post('/api/vote', voter, (req, res) => {
