@@ -72,6 +72,7 @@ const sendEmail = async (to, subject, text) => { if (!to) return false; console.
 const norm = m => String(m || '').replace(/\D/g, '').slice(-10), hash = s => crypto.createHash('sha256').update(s).digest('hex');
 const status = e => { const n = Date.now(); if (e.locked) return 'LOCKED'; if (n < Date.parse(e.start_at)) return 'UPCOMING'; if (n <= Date.parse(e.end_at)) return 'OPEN'; return n >= Date.parse(e.result_at || e.end_at) ? 'RESULTS' : 'CLOSED'; };
 const hits = new Map(), limit = (n, ms) => (req, res, next) => { const k = req.ip + req.path, now = Date.now(), a = (hits.get(k) || []).filter(t => now - t < ms); a.push(now); hits.set(k, a); a.length > n ? res.status(429).json({ error: 'Too many attempts. Please try again later.' }) : next(); };
+try { db.exec('ALTER TABLE voter_participation ADD COLUMN via TEXT'); } catch (e) { /* already there */ }
 const adminTokens = new Set(), sessions = new Map();
 const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '80mb' }));
 // Mark the database "changed" after any successful write so the background job backs it up
@@ -123,14 +124,14 @@ app.get(['/privacy', '/privacy-policy'], (req, res) => {
 });
 
 // Works whether index.html sits in ./public/ or in the repo root (only index.html is ever served from the root, never server.js or the database)
-const BUILD = '2026-10-13-no-whatsapp';
+const BUILD = '2026-10-13d-password-tempotp-fbvotes';
 const PUB = path.join(__dirname, 'public'), CANDS = [path.join(PUB, 'index.html'), path.join(__dirname, 'index.html')].filter(f => fs.existsSync(f)).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs), HOME = CANDS[0];  // if two copies exist, the newest one wins
 const sendHome = (_, res) => HOME ? res.sendFile(HOME, { headers: { 'Cache-Control': 'no-cache' } }) : res.status(500).send('index.html not found. Place it in the public/ folder.');
 app.get(['/', '/index.html'], sendHome);
 if (fs.existsSync(PUB)) app.use(express.static(PUB, { index: false }));
 app.get('/version', (_, res) => res.json({ build: BUILD, page_served_from: HOME ? path.relative(__dirname, HOME) : null, page_modified: HOME ? fs.statSync(HOME).mtime.toISOString() : null }));
 const admin = (req, res, next) => adminTokens.has(req.get('x-token')) ? next() : res.status(401).json({ error: 'Please log in as commissioner.' });
-const voter = (req, res, next) => { const s = sessions.get(req.get('x-session')); if (!s || s.exp < Date.now()) return res.status(401).json({ error: 'Session expired. Please verify your OTP again.' }); req.member = s.member_id; next(); };
+const voter = (req, res, next) => { const s = sessions.get(req.get('x-session')); if (!s || s.exp < Date.now()) return res.status(401).json({ error: 'Session expired. Please verify your OTP again.' }); req.member = s.member_id; req.via = s.via || 'otp'; next(); };
 const view = e => {
   const st = status(e), eligible = db.prepare('SELECT COUNT(*) c FROM members WHERE eligible=1').get().c, polled = db.prepare('SELECT COUNT(*) c FROM voter_participation WHERE election_id=?').get(e.id).c;
   const cands = db.prepare('SELECT id,code,name,description FROM candidates WHERE election_id=? AND active=1 ORDER BY sort,id').all(e.id);
@@ -149,6 +150,48 @@ const adminWho = new Map(), getComm = m => db.prepare('SELECT * FROM commissione
 const issueAdmin = (req, mobile, how) => { const t = crypto.randomBytes(24).toString('hex'); adminTokens.add(t); adminWho.set(t, mobile); log(req, 'admin', 'ADMIN_LOGIN_' + how, null, 'XXXXXX' + mobile.slice(-4)); return t; };
 app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });   // never let the browser keep API answers (ballot, lists) for the Back button
 app.post('/api/admin/logout', admin, (req, res) => { const t = req.get('x-token'); adminTokens.delete(t); adminWho.delete(t); res.json({ ok: true }); });
+// ---- Changeable commissioner password (stored as a salted hash; replaces the ADMIN_PASSWORD value once changed) ----
+db.exec('CREATE TABLE IF NOT EXISTS admin_auth(id INTEGER PRIMARY KEY CHECK(id=1), salt TEXT, hash TEXT, updated_at TEXT, updated_by TEXT)');
+const pwCheck = p => { const r = db.prepare('SELECT * FROM admin_auth WHERE id=1').get(); return r ? crypto.timingSafeEqual(crypto.scryptSync(String(p), r.salt, 32), Buffer.from(r.hash, 'hex')) : crypto.timingSafeEqual(H(p), AH); };
+app.post('/api/admin/password', limit(8, 600000), admin, (req, res) => {
+  const tok = req.get('x-token'), viaOtp = adminWho.has(tok), np = String(req.body.new_password || ''), cur = String(req.body.current_password || '');
+  if (!viaOtp && !pwCheck(cur)) { log(req, 'admin', 'ADMIN_PASSWORD_CHANGE_FAILED'); return res.status(403).json({ error: 'The current password is not correct.' }); }
+  if (np.length < 8 || !/[A-Za-z]/.test(np) || !/\d/.test(np)) return res.status(400).json({ error: 'The new password needs at least 8 characters, with letters and numbers.' });
+  if (!viaOtp && np === cur) return res.status(400).json({ error: 'The new password must be different from the current one.' });
+  const salt = crypto.randomBytes(16).toString('hex');
+  db.prepare('INSERT INTO admin_auth(id,salt,hash,updated_at,updated_by) VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET salt=excluded.salt,hash=excluded.hash,updated_at=excluded.updated_at,updated_by=excluded.updated_by').run(salt, crypto.scryptSync(np, salt, 32).toString('hex'), new Date().toISOString(), viaOtp ? 'XXXXXX' + adminWho.get(tok).slice(-4) : 'password login');
+  for (const t of [...adminTokens]) if (t !== tok && !adminWho.has(t)) adminTokens.delete(t);   // other password sessions are signed out
+  log(req, 'admin', 'ADMIN_PASSWORD_CHANGED'); res.json({ ok: true });
+});
+// ---- Temporary OTP: the commissioner issues a one-time code for a member whose OTP is not arriving ----
+db.exec('CREATE TABLE IF NOT EXISTS temp_otps(id INTEGER PRIMARY KEY, mobile TEXT NOT NULL, member_id TEXT, hash TEXT NOT NULL, created_at TEXT, expires INTEGER, created_by TEXT, tries INTEGER DEFAULT 0, used_at TEXT, revoked INTEGER DEFAULT 0)');
+const tmpHash = (code, mobile) => crypto.createHash('sha256').update(code + ':' + mobile).digest('hex');
+app.post('/api/admin/temp-otp', admin, async (req, res) => {
+  const mobile = norm(req.body.mobile), m = await findMember(mobile);
+  if (!m) return res.status(404).json({ error: 'This mobile number is not a registered, eligible member.' });
+  const ops = openStatus(m);
+  if (!ops.length) return res.status(400).json({ error: 'There is no election open for voting right now.' });
+  if (ops.every(e => e.voted)) return res.status(400).json({ error: 'This member has already voted. Voting is allowed only once.' });
+  const mins = [5, 10, 30].includes(+req.body.minutes) ? +req.body.minutes : 10, code = String(crypto.randomInt(100000, 1000000)), who = adminWho.get(req.get('x-token')), by = who ? 'XXXXXX' + who.slice(-4) : 'password login';
+  db.prepare('UPDATE temp_otps SET revoked=1 WHERE mobile=? AND used_at IS NULL AND revoked=0').run(mobile);
+  db.prepare('INSERT INTO temp_otps(mobile,member_id,hash,created_at,expires,created_by) VALUES(?,?,?,?,?,?)').run(mobile, m.member_id, tmpHash(code, mobile), new Date().toISOString(), Date.now() + mins * 60000, by);
+  log(req, 'admin', 'TEMP_OTP_ISSUED', null, { mobile: 'XXXXXX' + mobile.slice(-4), minutes: mins, by });
+  res.json({ code, name: m.name, member_id: m.member_id, mobile, minutes: mins, expires_at: new Date(Date.now() + mins * 60000).toISOString() });
+});
+app.get('/api/admin/temp-otps', admin, (req, res) => res.json({ rows: db.prepare('SELECT t.id,t.mobile,t.member_id,t.created_at,t.expires,t.created_by,t.used_at,t.revoked,m.name FROM temp_otps t LEFT JOIN members m ON m.member_id=t.member_id ORDER BY t.id DESC LIMIT 50').all().map(r => ({ ...r, status: r.used_at ? 'Used' : r.revoked ? 'Cancelled' : r.expires < Date.now() ? 'Expired' : 'Active' })) }));
+app.post('/api/admin/temp-otp/cancel', admin, (req, res) => { db.prepare('UPDATE temp_otps SET revoked=1 WHERE id=? AND used_at IS NULL').run(+req.body.id || 0); log(req, 'admin', 'TEMP_OTP_CANCELLED'); res.json({ ok: true }); });
+app.post('/api/otp/temp-verify', limit(10, 600000), async (req, res) => {
+  const mobile = norm(req.body.mobile), code = String(req.body.code || '').trim(), bad = () => res.status(401).json({ error: 'That code is not correct or has expired. Ask the Commissioner for a new one.' });
+  const row = db.prepare('SELECT * FROM temp_otps WHERE mobile=? AND used_at IS NULL AND revoked=0 ORDER BY id DESC LIMIT 1').get(mobile);
+  if (!row || row.expires < Date.now() || row.tries >= 5) return bad();
+  db.prepare('UPDATE temp_otps SET tries=tries+1 WHERE id=?').run(row.id);
+  if (!crypto.timingSafeEqual(Buffer.from(tmpHash(code, mobile)), Buffer.from(row.hash))) { log(req, 'member', 'TEMP_OTP_WRONG', null, 'XXXXXX' + mobile.slice(-4)); return bad(); }
+  const m = await findMember(mobile); if (!m) return bad();
+  const ops = openStatus(m); if (!ops.length || ops.every(e => e.voted)) return res.status(400).json({ error: 'You have already voted, or no election is open.' });
+  db.prepare('UPDATE temp_otps SET used_at=? WHERE id=?').run(new Date().toISOString(), row.id);
+  const t = crypto.randomBytes(24).toString('hex'); sessions.set(t, { member_id: m.id, exp: Date.now() + 15 * 60000, via: 'temp-otp' });
+  log(req, 'member:' + m.member_id, 'TEMP_OTP_USED'); res.json({ session: t, name: m.name });
+});
 app.get('/api/admin/login-info', (req, res) => res.json({ password: process.env.ADMIN_PASSWORD_LOGIN !== 'off' }));
 app.post('/api/admin/otp/options', limit(10, 600000), (req, res) => {
   const m = norm(req.body.mobile), c = getComm(m);
@@ -186,7 +229,7 @@ app.post('/api/admin/commissioners/remove', admin, (req, res) => {
 });
 app.post('/api/admin/login', limit(8, 60000), (req, res) => {
   if (process.env.ADMIN_PASSWORD_LOGIN === 'off') return res.status(403).json({ error: 'Password login is turned off. Please log in with an OTP.' });
-  const ok = crypto.timingSafeEqual(H(req.body.password), AH); log(req, 'admin', ok ? 'ADMIN_LOGIN' : 'ADMIN_LOGIN_FAILED');
+  const ok = pwCheck(req.body.password); log(req, 'admin', ok ? 'ADMIN_LOGIN' : 'ADMIN_LOGIN_FAILED');
   if (!ok) return res.status(401).json({ error: 'Wrong password' });
   const t = crypto.randomBytes(24).toString('hex'); adminTokens.add(t); res.json({ token: t });
 });
@@ -248,6 +291,25 @@ async function findMember(mobile) {
 }
 async function pullMembers() { const d = await rtdb('GET', 'members.json') || {}; let n = 0, skipped = 0; for (const v of Object.values(d)) (upsertLocal(v) ? n++ : skipped++); return { pulled: n, skipped }; }
 async function pushAllMembers() { const map = {}; for (const m of db.prepare('SELECT * FROM members').all()) map[fbKey(m.member_id)] = fbVal(m.member_id, m.name, m.mobile, m.email, m.category, m.eligible); return { pushed: await fbPushMany(map) }; }
+// Voting records in Firebase. votes/<election>/<member ID> = who voted, with all their details (NOT who they voted for).
+// ballots/<election>/<transaction> = the choice, with no member ID and no time, so a vote can never be traced back to a person.
+const fbQueue = [], fbEnc = encodeURIComponent;
+const fbVotePayload = (e, m, at, via) => ({ member_id: m.member_id, name: m.name || '', mobile: m.mobile, email: m.email || '', category: m.category || '', election_code: e.code, election_name: e.name, post: e.post, voted_at: at, verified_by: via || 'unknown' });
+async function fbWriteVote(job) { await rtdb('PUT', `votes/${fbEnc(fbKey(job.code))}/${fbEnc(fbKey(job.mid))}.json`, job.p); await rtdb('PUT', `ballots/${fbEnc(fbKey(job.code))}/${fbEnc(job.txn)}.json`, job.b); }
+function fbRecordVote(e, m, candId, txn, at, via) {
+  if (!rtdbReady() || !m) return;
+  const cand = db.prepare('SELECT name FROM candidates WHERE id=?').get(candId), job = { code: e.code, mid: m.member_id, txn, p: fbVotePayload(e, m, at, via), b: { election_code: e.code, candidate_id: candId, candidate_name: cand ? cand.name : '' } };
+  fbWriteVote(job).catch(err => { console.error('Firebase vote write failed, will retry:', err.message); fbQueue.push(job); });
+}
+setInterval(async () => { if (!fbQueue.length || !rtdbReady()) return; for (const job of fbQueue.splice(0)) { try { await fbWriteVote(job); } catch (e) { fbQueue.push(job); } } }, 60000);
+async function pushAllVotes() {
+  const rows = db.prepare('SELECT p.voted_at, p.via, m.member_id, m.name, m.mobile, m.email, m.category, e.code, e.name AS ename, e.post FROM voter_participation p JOIN members m ON m.id=p.member_id JOIN elections e ON e.id=p.election_id').all(), votes = {}, ballots = {};
+  for (const r of rows) (votes[fbKey(r.code)] ||= {})[fbKey(r.member_id)] = fbVotePayload({ code: r.code, name: r.ename, post: r.post }, r, r.voted_at, r.via);
+  for (const b of db.prepare('SELECT b.txn_id, b.candidate_id, c.name cname, e.code FROM ballots b JOIN elections e ON e.id=b.election_id LEFT JOIN candidates c ON c.id=b.candidate_id').all()) (ballots[fbKey(b.code)] ||= {})[b.txn_id] = { election_code: b.code, candidate_id: b.candidate_id, candidate_name: b.cname || '' };
+  for (const c of Object.keys(votes)) await rtdb('PATCH', `votes/${fbEnc(c)}.json`, votes[c]);
+  for (const c of Object.keys(ballots)) await rtdb('PATCH', `ballots/${fbEnc(c)}.json`, ballots[c]);
+  return { votes: rows.length, ballots: Object.values(ballots).reduce((n, o) => n + Object.keys(o).length, 0) };
+}
 async function saveToFirebase(filename, good, rejected) {
   if (!rtdbReady()) return { skipped: 'Firebase database is not configured.' };
   try {
@@ -404,10 +466,11 @@ app.get('/api/admin/firebase', admin, async (req, res) => {
   catch (e) { res.json({ configured: true, error: e.message }); }
 });
 app.post('/api/admin/firebase/push', admin, async (req, res) => { if (!rtdbReady()) return res.status(400).json({ error: 'Firebase is not connected yet. In Hostinger add FIREBASE_SERVICE_ACCOUNT (or FIREBASE_DB_SECRET) and restart the app.' }); try { const r = await pushAllMembers(); log(req, 'admin', 'FIREBASE_PUSH', null, r); res.json({ ok: true, ...r }); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.post('/api/admin/firebase/push-votes', admin, async (req, res) => { if (!rtdbReady()) return res.status(400).json({ error: 'Firebase is not connected yet. In Hostinger add FIREBASE_SERVICE_ACCOUNT (or FIREBASE_DB_SECRET) and restart the app.' }); try { const r = await pushAllVotes(); log(req, 'admin', 'FIREBASE_PUSH_VOTES', null, r); res.json({ ok: true, ...r }); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.post('/api/admin/firebase/pull', admin, async (req, res) => { if (!rtdbReady()) return res.status(400).json({ error: 'Firebase is not connected yet. In Hostinger add FIREBASE_SERVICE_ACCOUNT (or FIREBASE_DB_SECRET) and restart the app.' }); try { const r = await pullMembers(); log(req, 'admin', 'FIREBASE_PULL', null, r); res.json({ ok: true, ...r }); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get('/api/admin/participation/:id', admin, (req, res) => {
   const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id); if (!e) return res.status(404).json({ error: 'Election not found.' });
-  const voted = db.prepare('SELECT m.member_id,m.name,m.mobile,m.category,p.voted_at FROM voter_participation p JOIN members m ON m.id=p.member_id WHERE p.election_id=? ORDER BY p.voted_at DESC').all(e.id);
+  const voted = db.prepare('SELECT m.member_id,m.name,m.mobile,m.category,p.voted_at,p.via FROM voter_participation p JOIN members m ON m.id=p.member_id WHERE p.election_id=? ORDER BY p.voted_at DESC').all(e.id);
   const pending = db.prepare('SELECT member_id,name,mobile,category FROM members WHERE eligible=1 AND id NOT IN (SELECT member_id FROM voter_participation WHERE election_id=?) ORDER BY member_id').all(e.id);
   if (req.query.log) log(req, 'admin', 'VOTER_LIST_VIEWED', e.id, { voted: voted.length, pending: pending.length });
   res.json({ election: view(e), voted, pending });
@@ -440,6 +503,7 @@ app.post('/api/admin/audit', admin, limit(5, 60000), (req, res) => {
   const { key, reason, election_id } = req.body;
   if (key !== AUDIT_KEY) { log(req, 'admin', 'RESTRICTED_AUDIT_DENIED', election_id, reason); return res.status(403).json({ error: 'Invalid audit key.' }); }
   if (!reason || reason.trim().length < 10) return res.status(400).json({ error: 'Please give a written reason (at least 10 characters).' });
+  if (!election_id || !db.prepare('SELECT 1 FROM elections WHERE id=?').get(election_id)) return res.status(400).json({ error: 'Please choose an election.' });
   log(req, 'admin', 'RESTRICTED_AUDIT_ACCESS', election_id, reason);
   res.json({ participation: db.prepare('SELECT m.member_id,m.name,p.voted_at FROM voter_participation p JOIN members m ON m.id=p.member_id WHERE p.election_id=?').all(election_id), log: db.prepare('SELECT at,actor,action,detail,ip FROM audit_log WHERE election_id=? ORDER BY id DESC LIMIT 100').all(election_id) });
 });
@@ -485,7 +549,7 @@ app.post('/api/otp/verify', limit(15, 600000), (req, res) => {
   log(req, 'member:' + m.member_id, good ? 'OTP_VERIFIED' : 'OTP_FAILED');
   if (!good) { db.prepare('UPDATE otps SET tries=tries+1 WHERE mobile=?').run(mobile); return res.status(400).json({ error: 'Incorrect OTP. Please try again.' }); }
   db.prepare('DELETE FROM otps WHERE mobile=?').run(mobile);
-  const t = crypto.randomBytes(24).toString('hex'); sessions.set(t, { member_id: m.id, exp: Date.now() + 15 * 60000 }); res.json({ session: t, name: m.name });
+  const t = crypto.randomBytes(24).toString('hex'); sessions.set(t, { member_id: m.id, exp: Date.now() + 15 * 60000, via: 'otp' }); res.json({ session: t, name: m.name });
 });
 const last10 = n => String(n || '').replace(/\D/g, '').slice(-10);
 // ---- Firebase Authentication (Phone / SMS OTP). The browser signs in with Firebase; here we verify Google's signed ID token and match the phone number to the member ----
@@ -520,7 +584,7 @@ app.post('/api/firebase/verify', limit(10, 600000), async (req, res) => {
     if (!ops.length) return res.status(400).json({ error: 'There is no election open for voting right now.' });
     if (ops.every(e => e.voted)) { log(req, 'member:' + m.member_id, 'FIREBASE_BLOCKED_ALREADY_VOTED'); return res.status(400).json({ error: 'You have already voted. Voting is allowed only once.' }); }
     fbUsed.set(tid, Date.now() + 600000);
-    const t = crypto.randomBytes(24).toString('hex'); sessions.set(t, { member_id: m.id, exp: Date.now() + 15 * 60000 });
+    const t = crypto.randomBytes(24).toString('hex'); sessions.set(t, { member_id: m.id, exp: Date.now() + 15 * 60000, via: 'firebase-sms' });
     log(req, 'member:' + m.member_id, 'FIREBASE_SESSION_STARTED'); res.json({ session: t, name: m.name });
   } catch (e) { log(req, 'member', 'FIREBASE_VERIFY_FAILED', null, String(e.message).slice(0, 80)); res.status(401).json({ error: 'Could not verify your phone number. Please try again.' }); }
 });
@@ -529,13 +593,14 @@ app.post('/api/vote', voter, (req, res) => {
   const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.body.election_id);
   if (!e || status(e) !== 'OPEN') return res.status(400).json({ error: status(e || { start_at: 0, end_at: 0 }) === 'UPCOMING' ? 'Voting has not started yet.' : 'Voting has ended.' });
   if (!db.prepare('SELECT 1 FROM candidates WHERE id=? AND election_id=? AND active=1').get(req.body.candidate_id, e.id)) return res.status(400).json({ error: 'Invalid candidate.' });
-  const txn = 'TX-' + crypto.randomBytes(8).toString('hex').toUpperCase();
+  const txn = 'TX-' + crypto.randomBytes(8).toString('hex').toUpperCase(), at = new Date().toISOString();
   try {
     db.transaction(() => {   // both rows succeed or neither; UNIQUE(election_id,member_id) blocks races
-      db.prepare('INSERT INTO voter_participation(election_id,member_id,voted_at) VALUES(?,?,?)').run(e.id, req.member, new Date().toISOString());
+      db.prepare('INSERT INTO voter_participation(election_id,member_id,voted_at,via) VALUES(?,?,?,?)').run(e.id, req.member, at, req.via);
       db.prepare('INSERT INTO ballots(txn_id,election_id,candidate_id) VALUES(?,?,?)').run(txn, e.id, req.body.candidate_id);
     })();
     log(req, 'member', 'VOTE_RECORDED', e.id, 'ok'); res.json({ ok: true, txn });
+    fbRecordVote(e, db.prepare('SELECT * FROM members WHERE id=?').get(req.member), req.body.candidate_id, txn, at, req.via);
   } catch (err) { log(req, 'member', 'DUPLICATE_VOTE_ATTEMPT', e.id); res.status(409).json({ error: 'You have already cast your vote for this election. You cannot vote again.' }); }
 });
 
