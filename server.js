@@ -149,7 +149,67 @@ const view = e => {
 const tally = id => { const r = db.prepare('SELECT c.name,COUNT(b.txn_id) votes FROM candidates c LEFT JOIN ballots b ON b.candidate_id=c.id WHERE c.election_id=? AND c.active=1 GROUP BY c.id ORDER BY votes DESC').all(id), t = r.reduce((a, x) => a + x.votes, 0); return r.map(x => ({ ...x, pct: t ? +(x.votes * 100 / t).toFixed(1) : 0 })); };
 
 // ================= Admin =================
+// ---- Commissioner OTP login. Authorised numbers live in the "commissioners" table; the primary number can never be removed. ----
+db.exec('CREATE TABLE IF NOT EXISTS commissioners(id INTEGER PRIMARY KEY, mobile TEXT UNIQUE NOT NULL, name TEXT, is_primary INTEGER DEFAULT 0, added_at TEXT, added_by TEXT)');
+const PRIMARY_COMM = String(process.env.COMMISSIONER_MOBILE || '9430375773').replace(/\D/g, '').slice(-10);
+db.prepare('INSERT OR IGNORE INTO commissioners(mobile,name,is_primary,added_at,added_by) VALUES(?,?,1,?,?)').run(PRIMARY_COMM, 'Chief Commissioner', new Date().toISOString(), 'system');
+const adminWho = new Map(), admOtps = new Map(), getComm = m => db.prepare('SELECT * FROM commissioners WHERE mobile=?').get(m);
+const issueAdmin = (req, mobile, how) => { const t = crypto.randomBytes(24).toString('hex'); adminTokens.add(t); adminWho.set(t, mobile); log(req, 'admin', 'ADMIN_LOGIN_' + how, null, 'XXXXXX' + mobile.slice(-4)); return t; };
+app.get('/api/admin/login-info', (req, res) => res.json({ password: process.env.ADMIN_PASSWORD_LOGIN !== 'off' }));
+app.post('/api/admin/otp/options', limit(10, 600000), (req, res) => {
+  const m = norm(req.body.mobile), c = getComm(m);
+  if (!c) { log(req, 'admin', 'ADMIN_OTP_REJECTED', null, 'XXXXXX' + m.slice(-4)); return res.status(403).json({ error: 'This mobile number is not authorised for commissioner login.' }); }
+  res.json({ name: c.name || 'Commissioner', firebase: !!fbConfig(), whatsapp: waOtpReady(), fbcfg: fbConfig() });
+});
+app.post('/api/admin/otp/request', limit(5, 600000), async (req, res) => {   // WhatsApp delivery
+  const m = norm(req.body.mobile);
+  if (!getComm(m)) return res.status(403).json({ error: 'This mobile number is not authorised for commissioner login.' });
+  if (!waOtpReady()) return res.status(503).json({ error: 'OTP on WhatsApp is not set up yet.' });
+  const old = admOtps.get(m); if (old && Date.now() - old.at < 30000) return res.status(429).json({ error: 'Please wait 30 seconds before asking for another OTP.' });
+  const otp = String(crypto.randomInt(100000, 1000000));
+  admOtps.set(m, { h: crypto.createHash('sha256').update(otp + m).digest('hex'), exp: Date.now() + 300000, tries: 0, at: Date.now() });
+  if (!await sendWhatsAppOtp(m, otp)) { admOtps.delete(m); return res.status(502).json({ error: 'Could not send the OTP on WhatsApp right now.' }); }
+  log(req, 'admin', 'ADMIN_OTP_SENT', null, 'XXXXXX' + m.slice(-4)); res.json({ ok: true });
+});
+app.post('/api/admin/otp/verify', limit(10, 600000), (req, res) => {
+  const m = norm(req.body.mobile), e = admOtps.get(m), bad = () => res.status(401).json({ error: 'That OTP is not correct or has expired.' });
+  if (!e || e.exp < Date.now() || !getComm(m)) return bad();
+  if (++e.tries > 5) { admOtps.delete(m); return bad(); }
+  const h = crypto.createHash('sha256').update(String(req.body.otp || '').trim() + m).digest('hex');
+  if (!crypto.timingSafeEqual(Buffer.from(h), Buffer.from(e.h))) { log(req, 'admin', 'ADMIN_OTP_WRONG', null, 'XXXXXX' + m.slice(-4)); return bad(); }
+  admOtps.delete(m); res.json({ token: issueAdmin(req, m, 'OTP') });
+});
+app.post('/api/admin/login-firebase', limit(10, 600000), async (req, res) => {   // Firebase SMS OTP
+  if (!fbConfig()) return res.status(503).json({ error: 'Firebase sign-in is not set up.' });
+  try {
+    const pl = await verifyFirebaseToken(req.body.idToken), m = norm(req.body.mobile), tid = crypto.createHash('sha256').update(String(req.body.idToken)).digest('hex');
+    if (fbUsed.has(tid)) throw new Error('already used');
+    if (pl.firebase?.sign_in_provider !== 'phone' || !pl.phone_number || last10(pl.phone_number) !== m) throw new Error('number mismatch');
+    if (!getComm(m)) { log(req, 'admin', 'ADMIN_OTP_REJECTED', null, 'XXXXXX' + m.slice(-4)); return res.status(403).json({ error: 'This mobile number is not authorised for commissioner login.' }); }
+    fbUsed.set(tid, Date.now() + 600000); res.json({ token: issueAdmin(req, m, 'FIREBASE') });
+  } catch (e) { log(req, 'admin', 'ADMIN_LOGIN_FAILED', null, String(e.message).slice(0, 60)); res.status(401).json({ error: 'Could not verify your phone number. Please try again.' }); }
+});
+// Managing who can log in (commissioners only)
+app.get('/api/admin/commissioners', admin, (req, res) => res.json({ rows: db.prepare('SELECT mobile,name,is_primary,added_at,added_by FROM commissioners ORDER BY is_primary DESC, id').all(), you: adminWho.get(req.get('x-token')) || null }));
+app.post('/api/admin/commissioners/add', admin, (req, res) => {
+  const m = norm(req.body.mobile), name = String(req.body.name || '').trim();
+  if (m.length !== 10 || !/^[6-9]/.test(m)) return res.status(400).json({ error: 'Enter a valid 10-digit mobile number.' });
+  if (!name) return res.status(400).json({ error: 'Please enter the name of the person.' });
+  if (getComm(m)) return res.status(400).json({ error: 'This number already has commissioner access.' });
+  db.prepare('INSERT INTO commissioners(mobile,name,is_primary,added_at,added_by) VALUES(?,?,0,?,?)').run(m, name, new Date().toISOString(), adminWho.get(req.get('x-token')) || 'password login');
+  log(req, 'admin', 'COMMISSIONER_ADDED', null, 'XXXXXX' + m.slice(-4)); res.json({ ok: true });
+});
+app.post('/api/admin/commissioners/remove', admin, (req, res) => {
+  const m = norm(req.body.mobile), c = getComm(m);
+  if (!c) return res.status(404).json({ error: 'Number not found.' });
+  if (c.is_primary) return res.status(400).json({ error: 'The primary commissioner cannot be removed.' });
+  if (adminWho.get(req.get('x-token')) === m) return res.status(400).json({ error: 'You cannot remove your own number while logged in with it.' });
+  db.prepare('DELETE FROM commissioners WHERE mobile=?').run(m);
+  for (const [t, who] of adminWho) if (who === m) { adminTokens.delete(t); adminWho.delete(t); }
+  log(req, 'admin', 'COMMISSIONER_REMOVED', null, 'XXXXXX' + m.slice(-4)); res.json({ ok: true });
+});
 app.post('/api/admin/login', limit(8, 60000), (req, res) => {
+  if (process.env.ADMIN_PASSWORD_LOGIN === 'off') return res.status(403).json({ error: 'Password login is turned off. Please log in with an OTP.' });
   const ok = crypto.timingSafeEqual(H(req.body.password), AH); log(req, 'admin', ok ? 'ADMIN_LOGIN' : 'ADMIN_LOGIN_FAILED');
   if (!ok) return res.status(401).json({ error: 'Wrong password' });
   const t = crypto.randomBytes(24).toString('hex'); adminTokens.add(t); res.json({ token: t });
@@ -164,9 +224,19 @@ app.get('/api/admin/dashboard', admin, (req, res) => {
 const rtdbReady = () => !!(process.env.FIREBASE_DATABASE_URL && (process.env.FIREBASE_DB_SECRET || process.env.FIREBASE_SERVICE_ACCOUNT));
 const fbKey = id => String(id).replace(/[.$#\[\]\/]/g, '_');
 let fbTok = { t: '', exp: 0 };
+// Accepts the downloaded key file pasted whole, even if the host turned its line breaks into real new lines
+function parseServiceAccount(raw) {
+  let sa; try { sa = JSON.parse(raw); } catch (e) {
+    const em = /"client_email"\s*:\s*"([^"]+)"/.exec(raw || ''), pk = /-----BEGIN PRIVATE KEY-----[\s\S]*?-----END PRIVATE KEY-----/.exec(raw || '');
+    if (em && pk) sa = { client_email: em[1], private_key: pk[0].replace(/\\n/g, '\n') };
+  }
+  if (!sa || !sa.client_email || !sa.private_key) throw new Error('FIREBASE_SERVICE_ACCOUNT in Hostinger is not valid. Paste the entire contents of the downloaded key file, from the first { to the last }.');
+  return sa;
+}
 async function fbAccessToken() {
   if (fbTok.exp > Date.now() + 60000) return fbTok.t;
-  const sa = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT), now = Math.floor(Date.now() / 1000), b = o => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const sa = parseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT);
+  const now = Math.floor(Date.now() / 1000), b = o => Buffer.from(JSON.stringify(o)).toString('base64url');
   const head = b({ alg: 'RS256', typ: 'JWT' }), body = b({ iss: sa.client_email, scope: 'https://www.googleapis.com/auth/firebase.database https://www.googleapis.com/auth/userinfo.email', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 });
   const jwt = head + '.' + body + '.' + crypto.createSign('RSA-SHA256').update(head + '.' + body).sign(String(sa.private_key).replace(/\\n/g, '\n')).toString('base64url');
   const r = await fetch(process.env.FIREBASE_TOKEN_URL || 'https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer') + '&assertion=' + jwt });
@@ -357,8 +427,8 @@ app.get('/api/admin/firebase', admin, async (req, res) => {
   try { const k = await rtdb('GET', 'members.json?shallow=true'); res.json({ configured: true, in_firebase: Object.keys(k || {}).length, local: db.prepare('SELECT COUNT(*) c FROM members').get().c }); }
   catch (e) { res.json({ configured: true, error: e.message }); }
 });
-app.post('/api/admin/firebase/push', admin, async (req, res) => { try { const r = await pushAllMembers(); log(req, 'admin', 'FIREBASE_PUSH', null, r); res.json({ ok: true, ...r }); } catch (e) { res.status(502).json({ error: e.message }); } });
-app.post('/api/admin/firebase/pull', admin, async (req, res) => { try { const r = await pullMembers(); log(req, 'admin', 'FIREBASE_PULL', null, r); res.json({ ok: true, ...r }); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.post('/api/admin/firebase/push', admin, async (req, res) => { if (!rtdbReady()) return res.status(400).json({ error: 'Firebase is not connected yet. In Hostinger add FIREBASE_SERVICE_ACCOUNT (or FIREBASE_DB_SECRET) and restart the app.' }); try { const r = await pushAllMembers(); log(req, 'admin', 'FIREBASE_PUSH', null, r); res.json({ ok: true, ...r }); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.post('/api/admin/firebase/pull', admin, async (req, res) => { if (!rtdbReady()) return res.status(400).json({ error: 'Firebase is not connected yet. In Hostinger add FIREBASE_SERVICE_ACCOUNT (or FIREBASE_DB_SECRET) and restart the app.' }); try { const r = await pullMembers(); log(req, 'admin', 'FIREBASE_PULL', null, r); res.json({ ok: true, ...r }); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get('/api/admin/participation/:id', admin, (req, res) => {
   const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id); if (!e) return res.status(404).json({ error: 'Election not found.' });
   const voted = db.prepare('SELECT m.member_id,m.name,m.mobile,m.category,p.voted_at FROM voter_participation p JOIN members m ON m.id=p.member_id WHERE p.election_id=? ORDER BY p.voted_at DESC').all(e.id);
