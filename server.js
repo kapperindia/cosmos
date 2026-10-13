@@ -123,9 +123,12 @@ app.get(['/privacy', '/privacy-policy'], (req, res) => {
 });
 
 // Works whether index.html sits in ./public/ or in the repo root (only index.html is ever served from the root, never server.js or the database)
-const PUB = path.join(__dirname, 'public'), HOME = [path.join(PUB, 'index.html'), path.join(__dirname, 'index.html')].find(f => fs.existsSync(f));
-if (fs.existsSync(PUB)) app.use(express.static(PUB));
-app.get('/', (_, res) => HOME ? res.sendFile(HOME) : res.status(500).send('index.html not found. Place it in the public/ folder.'));
+const BUILD = '2026-10-13-no-whatsapp';
+const PUB = path.join(__dirname, 'public'), CANDS = [path.join(PUB, 'index.html'), path.join(__dirname, 'index.html')].filter(f => fs.existsSync(f)).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs), HOME = CANDS[0];  // if two copies exist, the newest one wins
+const sendHome = (_, res) => HOME ? res.sendFile(HOME, { headers: { 'Cache-Control': 'no-cache' } }) : res.status(500).send('index.html not found. Place it in the public/ folder.');
+app.get(['/', '/index.html'], sendHome);
+if (fs.existsSync(PUB)) app.use(express.static(PUB, { index: false }));
+app.get('/version', (_, res) => res.json({ build: BUILD, page_served_from: HOME ? path.relative(__dirname, HOME) : null, page_modified: HOME ? fs.statSync(HOME).mtime.toISOString() : null }));
 const admin = (req, res, next) => adminTokens.has(req.get('x-token')) ? next() : res.status(401).json({ error: 'Please log in as commissioner.' });
 const voter = (req, res, next) => { const s = sessions.get(req.get('x-session')); if (!s || s.exp < Date.now()) return res.status(401).json({ error: 'Session expired. Please verify your OTP again.' }); req.member = s.member_id; next(); };
 const view = e => {
@@ -144,6 +147,8 @@ const PRIMARY_COMM = String(process.env.COMMISSIONER_MOBILE || '9430375773').rep
 db.prepare('INSERT OR IGNORE INTO commissioners(mobile,name,is_primary,added_at,added_by) VALUES(?,?,1,?,?)').run(PRIMARY_COMM, 'Chief Commissioner', new Date().toISOString(), 'system');
 const adminWho = new Map(), getComm = m => db.prepare('SELECT * FROM commissioners WHERE mobile=?').get(m);
 const issueAdmin = (req, mobile, how) => { const t = crypto.randomBytes(24).toString('hex'); adminTokens.add(t); adminWho.set(t, mobile); log(req, 'admin', 'ADMIN_LOGIN_' + how, null, 'XXXXXX' + mobile.slice(-4)); return t; };
+app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });   // never let the browser keep API answers (ballot, lists) for the Back button
+app.post('/api/admin/logout', admin, (req, res) => { const t = req.get('x-token'); adminTokens.delete(t); adminWho.delete(t); res.json({ ok: true }); });
 app.get('/api/admin/login-info', (req, res) => res.json({ password: process.env.ADMIN_PASSWORD_LOGIN !== 'off' }));
 app.post('/api/admin/otp/options', limit(10, 600000), (req, res) => {
   const m = norm(req.body.mobile), c = getComm(m);
