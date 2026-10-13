@@ -67,22 +67,13 @@ const log = (req, actor, action, eid, detail) => {
 };
 // ---- SMS / email: plug in your provider (MSG91, Twilio, SES, SMTP). Return true on success. ----
 const sendSms = async (mobile, text) => { console.log(`[SMS ${mobile}] ${text}`); return true; };
-// WhatsApp OTP delivery (WhatsApp Cloud API, approved "authentication" template). Env: WA_ACCESS_TOKEN, WA_PHONE_NUMBER_ID, WA_OTP_TEMPLATE; optional WA_OTP_LANG (default en), WA_COUNTRY_CODE (default 91)
-const waOtpReady = () => !!(process.env.WA_ACCESS_TOKEN && process.env.WA_PHONE_NUMBER_ID && process.env.WA_OTP_TEMPLATE);
-async function sendWhatsAppOtp(mobile, otp) {
-  try {
-    const r = await fetch(`${process.env.WA_GRAPH_URL || 'https://graph.facebook.com/v21.0'}/${process.env.WA_PHONE_NUMBER_ID}/messages`, { method: 'POST', headers: { Authorization: 'Bearer ' + process.env.WA_ACCESS_TOKEN, 'Content-Type': 'application/json' }, body: JSON.stringify({ messaging_product: 'whatsapp', to: (process.env.WA_COUNTRY_CODE || '91') + mobile, type: 'template', template: { name: process.env.WA_OTP_TEMPLATE, language: { code: process.env.WA_OTP_LANG || 'en' }, components: [{ type: 'body', parameters: [{ type: 'text', text: otp }] }, { type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: otp }] }] } }) });
-    if (!r.ok) { const d = await r.json().catch(() => ({})); console.error('WhatsApp OTP failed', r.status, d.error?.message || ''); return false; }
-    return true;
-  } catch (e) { console.error('WhatsApp OTP error', e.message); return false; }
-}
 const sendEmail = async (to, subject, text) => { if (!to) return false; console.log(`[EMAIL ${to}] ${subject}: ${text}`); return true; };
 
 const norm = m => String(m || '').replace(/\D/g, '').slice(-10), hash = s => crypto.createHash('sha256').update(s).digest('hex');
 const status = e => { const n = Date.now(); if (e.locked) return 'LOCKED'; if (n < Date.parse(e.start_at)) return 'UPCOMING'; if (n <= Date.parse(e.end_at)) return 'OPEN'; return n >= Date.parse(e.result_at || e.end_at) ? 'RESULTS' : 'CLOSED'; };
 const hits = new Map(), limit = (n, ms) => (req, res, next) => { const k = req.ip + req.path, now = Date.now(), a = (hits.get(k) || []).filter(t => now - t < ms); a.push(now); hits.set(k, a); a.length > n ? res.status(429).json({ error: 'Too many attempts. Please try again later.' }) : next(); };
 const adminTokens = new Set(), sessions = new Map();
-const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '80mb', verify: (req, res, buf) => { if (req.originalUrl.startsWith('/api/wa/webhook')) req.rawBody = buf; } }));
+const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '80mb' }));
 // Mark the database "changed" after any successful write so the background job backs it up
 let dirty = false; app.use((req, res, next) => { if (req.method !== 'GET' && req.path.startsWith('/api/')) res.on('finish', () => { if (res.statusCode < 400) dirty = true; }); next(); });
 
@@ -93,7 +84,7 @@ const CSP = fbConfig()
   : "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:";
 app.use((req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': CSP }); next(); });
 app.get('/health', (_, res) => res.send('ok'));
-// Public privacy policy page (required by WhatsApp/Meta and good practice). Set ORG_NAME and CONTACT_EMAIL in the host's environment variables.
+// Public privacy policy page (good practice). Set ORG_NAME and CONTACT_EMAIL in the host's environment variables.
 const escH = x => String(x).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 app.get(['/privacy', '/privacy-policy'], (req, res) => {
   const org = escH(process.env.ORG_NAME || 'COSMEX'), mail = escH(process.env.CONTACT_EMAIL || 'the Election Commissioner'), upd = '12 October 2026';
@@ -105,31 +96,29 @@ app.get(['/privacy', '/privacy-policy'], (req, res) => {
 <h2>1. Information we collect</h2><ul>
 <li><b>Member register details</b> supplied by the association: member ID, name, mobile number, email address (if provided) and category.</li>
 <li><b>Voting records:</b> whether you have voted in each election and when. Your choice of candidate is stored separately (see section 4).</li>
-<li><b>Verification data:</b> a one-time password (stored only in scrambled form and deleted after use or expiry), or, if you choose WhatsApp verification, the WhatsApp number that sends us the verification code.</li>
+<li><b>Verification data:</b> a one-time password (stored only in scrambled form and deleted after use or expiry), or the phone number verified through Firebase when you choose SMS verification.</li>
 <li><b>Security logs:</b> actions taken on the portal (for example OTP requests, votes cast, commissioner actions) with the time and IP address, to detect misuse.</li></ul>
 <h2>2. How we use it</h2><ul>
 <li>To confirm you are a registered member and are allowed to vote.</li>
-<li>To send you a one-time password by SMS, or verify you through WhatsApp, and to send election notices.</li>
+<li>To send you a one-time password by SMS (including through Google Firebase phone verification), and to send election notices.</li>
 <li>To make sure each member votes only once, to count votes, to show turnout and results, and to give the Election Commissioner voter and yet-to-vote lists.</li>
 <li>To keep election records that can be checked later if a question is raised.</li></ul>
 <p>We do not sell your information, use it for advertising, or share it for marketing.</p>
-<h2>3. WhatsApp verification</h2>
-<p>If you choose "Verify with WhatsApp", you send a one-time code from your own WhatsApp to the association's WhatsApp number. WhatsApp (Meta) tells us the number the message came from, and we use it only to confirm that it matches your registered mobile number. We do not read your other chats, contacts or profile, and we do not use the number for anything else. WhatsApp's own use of data is governed by Meta's privacy policy.</p>
-<h2>4. Secrecy of your vote</h2>
+<h2>3. Secrecy of your vote</h2>
 <p>The portal records <i>that</i> you voted separately from <i>what</i> you chose. Ballots carry no member ID or time, so a vote cannot be linked back to a voter, not even by the Election Commissioner. Candidate-wise counts are shown only as the election rules allow.</p>
-<h2>5. Who can see your information</h2><ul>
+<h2>4. Who can see your information</h2><ul>
 <li>The Election Commissioner and authorised officials can see the member register and the voted / yet-to-vote lists.</li>
-<li>Our service providers who run the portal: the web host, the SMS and WhatsApp message providers, and the cloud services used for the member database and backups (Google Firebase and Supabase). They handle data only to provide these services.</li>
+<li>Our service providers who run the portal: the web host, the SMS provider, and the cloud services used for the member database and backups (Google Firebase and Supabase). They handle data only to provide these services.</li>
 <li>Authorities, where the law requires it.</li></ul>
-<h2>6. Storage, security and retention</h2>
+<h2>5. Storage, security and retention</h2>
 <p>Data is stored on secured servers and in private cloud storage. Access to commissioner functions needs a password. Backups are kept so records survive system changes. Because the association's elections must be verifiable, voting records, the audit log and uploaded member files are kept permanently and cannot be edited or deleted. Other member details are kept while you remain a member and as long as needed for the association's records.</p>
-<h2>7. Cookies and tracking</h2>
+<h2>6. Cookies and tracking</h2>
 <p>The portal does not use advertising cookies or third-party trackers.</p>
-<h2>8. Your choices and rights</h2>
+<h2>7. Your choices and rights</h2>
 <p>You may ask to see the information we hold about you, to correct wrong details (such as your mobile number or email), or to ask questions about how it is used. Election records already created cannot be erased, as explained above. Contact us at the address below.</p>
-<h2>9. Children</h2><p>The portal is for adult members of the association and is not intended for children.</p>
-<h2>10. Changes to this policy</h2><p>If we change this policy, the new version will be posted on this page with a new date.</p>
-<h2>11. Contact</h2><p>For privacy questions or requests, contact: <b>${mail}</b> (${org} Election Commissioner).</p>
+<h2>8. Children</h2><p>The portal is for adult members of the association and is not intended for children.</p>
+<h2>9. Changes to this policy</h2><p>If we change this policy, the new version will be posted on this page with a new date.</p>
+<h2>10. Contact</h2><p>For privacy questions or requests, contact: <b>${mail}</b> (${org} Election Commissioner).</p>
 </main></body></html>`);
 });
 
@@ -153,31 +142,13 @@ const tally = id => { const r = db.prepare('SELECT c.name,COUNT(b.txn_id) votes 
 db.exec('CREATE TABLE IF NOT EXISTS commissioners(id INTEGER PRIMARY KEY, mobile TEXT UNIQUE NOT NULL, name TEXT, is_primary INTEGER DEFAULT 0, added_at TEXT, added_by TEXT)');
 const PRIMARY_COMM = String(process.env.COMMISSIONER_MOBILE || '9430375773').replace(/\D/g, '').slice(-10);
 db.prepare('INSERT OR IGNORE INTO commissioners(mobile,name,is_primary,added_at,added_by) VALUES(?,?,1,?,?)').run(PRIMARY_COMM, 'Chief Commissioner', new Date().toISOString(), 'system');
-const adminWho = new Map(), admOtps = new Map(), getComm = m => db.prepare('SELECT * FROM commissioners WHERE mobile=?').get(m);
+const adminWho = new Map(), getComm = m => db.prepare('SELECT * FROM commissioners WHERE mobile=?').get(m);
 const issueAdmin = (req, mobile, how) => { const t = crypto.randomBytes(24).toString('hex'); adminTokens.add(t); adminWho.set(t, mobile); log(req, 'admin', 'ADMIN_LOGIN_' + how, null, 'XXXXXX' + mobile.slice(-4)); return t; };
 app.get('/api/admin/login-info', (req, res) => res.json({ password: process.env.ADMIN_PASSWORD_LOGIN !== 'off' }));
 app.post('/api/admin/otp/options', limit(10, 600000), (req, res) => {
   const m = norm(req.body.mobile), c = getComm(m);
   if (!c) { log(req, 'admin', 'ADMIN_OTP_REJECTED', null, 'XXXXXX' + m.slice(-4)); return res.status(403).json({ error: 'This mobile number is not authorised for commissioner login.' }); }
-  res.json({ name: c.name || 'Commissioner', firebase: !!fbConfig(), whatsapp: waOtpReady(), fbcfg: fbConfig() });
-});
-app.post('/api/admin/otp/request', limit(5, 600000), async (req, res) => {   // WhatsApp delivery
-  const m = norm(req.body.mobile);
-  if (!getComm(m)) return res.status(403).json({ error: 'This mobile number is not authorised for commissioner login.' });
-  if (!waOtpReady()) return res.status(503).json({ error: 'OTP on WhatsApp is not set up yet.' });
-  const old = admOtps.get(m); if (old && Date.now() - old.at < 30000) return res.status(429).json({ error: 'Please wait 30 seconds before asking for another OTP.' });
-  const otp = String(crypto.randomInt(100000, 1000000));
-  admOtps.set(m, { h: crypto.createHash('sha256').update(otp + m).digest('hex'), exp: Date.now() + 300000, tries: 0, at: Date.now() });
-  if (!await sendWhatsAppOtp(m, otp)) { admOtps.delete(m); return res.status(502).json({ error: 'Could not send the OTP on WhatsApp right now.' }); }
-  log(req, 'admin', 'ADMIN_OTP_SENT', null, 'XXXXXX' + m.slice(-4)); res.json({ ok: true });
-});
-app.post('/api/admin/otp/verify', limit(10, 600000), (req, res) => {
-  const m = norm(req.body.mobile), e = admOtps.get(m), bad = () => res.status(401).json({ error: 'That OTP is not correct or has expired.' });
-  if (!e || e.exp < Date.now() || !getComm(m)) return bad();
-  if (++e.tries > 5) { admOtps.delete(m); return bad(); }
-  const h = crypto.createHash('sha256').update(String(req.body.otp || '').trim() + m).digest('hex');
-  if (!crypto.timingSafeEqual(Buffer.from(h), Buffer.from(e.h))) { log(req, 'admin', 'ADMIN_OTP_WRONG', null, 'XXXXXX' + m.slice(-4)); return bad(); }
-  admOtps.delete(m); res.json({ token: issueAdmin(req, m, 'OTP') });
+  res.json({ name: c.name || 'Commissioner', firebase: !!fbConfig(), fbcfg: fbConfig() });
 });
 app.post('/api/admin/login-firebase', limit(10, 600000), async (req, res) => {   // Firebase SMS OTP
   if (!fbConfig()) return res.status(503).json({ error: 'Firebase sign-in is not set up.' });
@@ -484,11 +455,9 @@ app.post('/api/member/lookup', limit(10, 600000), async (req, res) => {
   if (!m) { log(req, 'member', 'LOOKUP_NOT_FOUND', null, 'XXXXXX' + mobile.slice(-4)); return res.status(404).json({ error: 'This mobile number is not registered for this election.' }); }
   const elections = openStatus(m), all = db.prepare('SELECT * FROM elections').all().map(status);
   const state = !elections.length ? (all.includes('UPCOMING') ? 'not_started' : 'ended') : elections.every(e => e.voted) ? 'all_voted' : 'can_vote';
-  res.json({ name: m.name || 'Member', member_id: m.member_id, elections, state, wa: !!(process.env.WA_BUSINESS_NUMBER && process.env.WA_APP_SECRET), wa_otp: waOtpReady(), fb: fbConfig() });
+  res.json({ name: m.name || 'Member', member_id: m.member_id, elections, state, fb: fbConfig() });
 });
 app.post('/api/otp/request', limit(6, 600000), async (req, res) => {
-  const ch = req.body.channel === 'whatsapp' ? 'whatsapp' : 'sms';
-  if (ch === 'whatsapp' && !waOtpReady()) return res.status(503).json({ error: 'OTP on WhatsApp is not set up yet. Please use the SMS OTP.' });
   const mobile = norm(req.body.mobile), m = await findMember(mobile);
   if (!m) { log(req, 'member', 'OTP_REJECTED_NOT_ELIGIBLE', null, 'XXXXXX' + mobile.slice(-4)); return res.status(403).json({ error: 'Mobile number is not registered for this election.' }); }
   const els = db.prepare('SELECT * FROM elections').all().map(status), ops = openStatus(m);
@@ -499,10 +468,8 @@ app.post('/api/otp/request', limit(6, 600000), async (req, res) => {
   if (o && o.resends >= 5 && Date.now() - o.sent_at < 3600000) return res.status(429).json({ error: 'Too many OTP requests. Please try again later.' });
   const otp = String(crypto.randomInt(100000, 1000000));
   db.prepare('INSERT OR REPLACE INTO otps(mobile,hash,expires,tries,sent_at,resends) VALUES(?,?,?,0,?,?)').run(mobile, hash(otp), Date.now() + cfg().otp_ttl * 1000, Date.now(), (o?.resends || 0) + 1);
-  if (ch === 'whatsapp') {
-    if (!await sendWhatsAppOtp(mobile, otp)) { db.prepare('DELETE FROM otps WHERE mobile=?').run(mobile); log(req, 'member:' + m.member_id, 'OTP_WHATSAPP_FAILED'); return res.status(502).json({ error: 'Could not send the OTP on WhatsApp right now. Please try the SMS OTP or WhatsApp verification.' }); }
-  } else await sendSms(mobile, `Your election OTP is ${otp}. Valid for ${Math.round(cfg().otp_ttl / 60)} minutes. Do not share it.`);
-  log(req, 'member:' + m.member_id, 'OTP_GENERATED', null, ch); res.json({ ok: true, channel: ch });
+  await sendSms(mobile, `Your election OTP is ${otp}. Valid for ${Math.round(cfg().otp_ttl / 60)} minutes. Do not share it.`);
+  log(req, 'member:' + m.member_id, 'OTP_GENERATED'); res.json({ ok: true });
 });
 app.post('/api/otp/verify', limit(15, 600000), (req, res) => {
   const mobile = norm(req.body.mobile), o = db.prepare('SELECT * FROM otps WHERE mobile=?').get(mobile), m = db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile);
@@ -515,56 +482,7 @@ app.post('/api/otp/verify', limit(15, 600000), (req, res) => {
   db.prepare('DELETE FROM otps WHERE mobile=?').run(mobile);
   const t = crypto.randomBytes(24).toString('hex'); sessions.set(t, { member_id: m.id, exp: Date.now() + 15 * 60000 }); res.json({ session: t, name: m.name });
 });
-// ---- WhatsApp reverse verification: the member SENDS a one-time code to the portal's WhatsApp number; WhatsApp tells us which number it came from ----
-// Needs the WhatsApp Business (Meta Cloud API) webhook. Env: WA_BUSINESS_NUMBER (e.g. 919876543210), WA_APP_SECRET, WA_VERIFY_TOKEN
-const waPending = new Map(), waByToken = new Map(), last10 = n => String(n || '').replace(/\D/g, '').slice(-10);
-setInterval(() => { for (const [c, p] of waPending) if (p.exp < Date.now()) { waPending.delete(c); waByToken.delete(p.token); } }, 60000).unref?.();
-const waReady = () => !!(process.env.WA_BUSINESS_NUMBER && process.env.WA_APP_SECRET);
-app.post('/api/wa/start', limit(6, 600000), async (req, res) => {
-  if (!waReady()) return res.status(503).json({ error: 'WhatsApp verification is not set up yet. Please use the OTP option.' });
-  const mobile = norm(req.body.mobile), m = await findMember(mobile);
-  if (!m) { log(req, 'member', 'WA_REJECTED_NOT_ELIGIBLE', null, 'XXXXXX' + mobile.slice(-4)); return res.status(403).json({ error: 'Mobile number is not registered for this election.' }); }
-  const ops = openStatus(m);
-  if (!ops.length) return res.status(400).json({ error: 'There is no election open for voting right now.' });
-  if (ops.every(e => e.voted)) { log(req, 'member:' + m.member_id, 'WA_BLOCKED_ALREADY_VOTED'); return res.status(400).json({ error: 'You have already voted. Voting is allowed only once.' }); }
-  for (const [c, p] of waPending) if (p.mobile === mobile) { waPending.delete(c); waByToken.delete(p.token); }
-  let code; do code = 'VOTE-' + crypto.randomInt(100000, 1000000); while (waPending.has(code));
-  const token = crypto.randomBytes(20).toString('hex'), ttl = 300;
-  waPending.set(code, { mobile, member_id: m.id, token, exp: Date.now() + ttl * 1000, verified: false }); waByToken.set(token, code);
-  log(req, 'member:' + m.member_id, 'WA_CODE_ISSUED');
-  res.json({ code, token, expires_in: ttl, link: `https://wa.me/${String(process.env.WA_BUSINESS_NUMBER).replace(/\D/g, '')}?text=${encodeURIComponent(code)}` });
-});
-app.get('/api/wa/status', limit(300, 600000), (req, res) => {
-  const code = waByToken.get(String(req.query.token || '')), p = code && waPending.get(code);
-  if (!p || p.exp < Date.now()) return res.json({ status: 'expired' });
-  if (!p.verified) return res.json({ status: 'waiting' });
-  const m = db.prepare('SELECT * FROM members WHERE id=? AND eligible=1').get(p.member_id);
-  waPending.delete(code); waByToken.delete(p.token);
-  if (!m) return res.json({ status: 'expired' });
-  const t = crypto.randomBytes(24).toString('hex'); sessions.set(t, { member_id: m.id, exp: Date.now() + 15 * 60000 });
-  log(req, 'member:' + m.member_id, 'WA_SESSION_STARTED'); res.json({ status: 'verified', session: t, name: m.name });
-});
-// Meta calls this once to confirm the webhook URL...
-app.get('/api/wa/webhook', (req, res) => {
-  if (req.query['hub.mode'] === 'subscribe' && process.env.WA_VERIFY_TOKEN && req.query['hub.verify_token'] === process.env.WA_VERIFY_TOKEN) return res.status(200).send(String(req.query['hub.challenge']));
-  res.sendStatus(403);
-});
-// ...and posts every incoming WhatsApp message here. Requests without a valid Meta signature are ignored.
-app.post('/api/wa/webhook', (req, res) => {
-  const secret = process.env.WA_APP_SECRET, sig = String(req.get('x-hub-signature-256') || '');
-  if (!secret || !req.rawBody) return res.sendStatus(403);
-  const want = 'sha256=' + crypto.createHmac('sha256', secret).update(req.rawBody).digest('hex');
-  if (sig.length !== want.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(want))) return res.sendStatus(403);
-  try {
-    for (const en of req.body.entry || []) for (const ch of en.changes || []) for (const msg of ch.value?.messages || []) {
-      const hit = String(msg.text?.body || '').toUpperCase().match(/VOTE-\d{6}/), p = hit && waPending.get(hit[0]);
-      if (!p || p.exp < Date.now() || p.verified) continue;
-      if (last10(msg.from) === p.mobile) { p.verified = true; log(req, 'member:' + p.member_id, 'WA_VERIFIED'); }
-      else log(req, 'member:' + p.member_id, 'WA_NUMBER_MISMATCH', null, 'sent from XXXXXX' + last10(msg.from).slice(-4));
-    }
-  } catch (e) { console.error('WA webhook error', e.message); }
-  res.sendStatus(200);
-});
+const last10 = n => String(n || '').replace(/\D/g, '').slice(-10);
 // ---- Firebase Authentication (Phone / SMS OTP). The browser signs in with Firebase; here we verify Google's signed ID token and match the phone number to the member ----
 let fbCerts = { exp: 0, keys: {} }; const fbUsed = new Map();
 async function fbKeys() {
