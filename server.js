@@ -124,7 +124,7 @@ app.get(['/privacy', '/privacy-policy'], (req, res) => {
 });
 
 // Works whether index.html sits in ./public/ or in the repo root (only index.html is ever served from the root, never server.js or the database)
-const BUILD = '2026-10-13d-password-tempotp-fbvotes';
+const BUILD = '2026-10-14a-firebase-list-autosync';
 const PUB = path.join(__dirname, 'public'), CANDS = [path.join(PUB, 'index.html'), path.join(__dirname, 'index.html')].filter(f => fs.existsSync(f)).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs), HOME = CANDS[0];  // if two copies exist, the newest one wins
 const sendHome = (_, res) => HOME ? res.sendFile(HOME, { headers: { 'Cache-Control': 'no-cache' } }) : res.status(500).send('index.html not found. Place it in the public/ folder.');
 app.get(['/', '/index.html'], sendHome);
@@ -269,27 +269,86 @@ async function rtdb(method, pathq, body) {
 }
 const fbVal = (mid, name, mobile, email, category, eligible) => ({ member_id: String(mid), name: name || '', mobile, email: email || '', category: category || '', eligible: !!eligible, updated_at: new Date().toISOString() });
 async function fbPushMany(map) { const keys = Object.keys(map); for (let i = 0; i < keys.length; i += 1000) { const part = {}; for (const k of keys.slice(i, i + 1000)) part[k] = map[k]; await rtdb('PATCH', 'members.json', part); } return keys.length; }
-// Copy one record from Firebase into the local working database (used for voting records)
-function upsertLocal(v) {
-  const mob = norm(v.mobile), mid = String(v.member_id || '').trim(); if (!mid || mob.length !== 10) return null;
-  const el = v.eligible === false ? 0 : 1, ex = db.prepare('SELECT id FROM members WHERE member_id=?').get(mid);
-  try {
-    if (ex) db.prepare('UPDATE members SET name=?,mobile=?,email=?,category=?,eligible=? WHERE id=?').run(v.name || '', mob, v.email || '', v.category || '', el, ex.id);
-    else db.prepare('INSERT INTO members(member_id,name,mobile,email,category,eligible) VALUES(?,?,?,?,?,?)').run(mid, v.name || '', mob, v.email || '', v.category || '', el);
-  } catch (e) { console.error('Could not copy member', mid, e.message); return null; }
-  return db.prepare('SELECT * FROM members WHERE member_id=?').get(mid);
+// ---- Reading member records from Firebase. People type or import them in the console in many shapes, so field names are matched loosely. ----
+const keyOf = k => String(k).toLowerCase().replace(/[^a-z0-9]/g, '');
+const pick = (o, names) => { for (const k of Object.keys(o)) if (names.includes(keyOf(k))) { const v = o[k]; if (v !== undefined && v !== null && typeof v !== 'object' && String(v).trim() !== '') return v; } return ''; };
+const ID_KEYS = ['memberid', 'empid', 'employeeid', 'empno', 'empcode', 'employeecode', 'membershipno', 'membershipnumber', 'memberno', 'id'],
+  MOB_KEYS = ['mobile', 'mobileno', 'mobilenumber', 'phone', 'phoneno', 'phonenumber', 'contact', 'contactno', 'contactnumber', 'cell', 'whatsapp'],
+  NAME_KEYS = ['name', 'membername', 'fullname', 'employeename', 'empname'], MAIL_KEYS = ['email', 'emailid', 'emailaddress', 'mail'],
+  CAT_KEYS = ['category', 'department', 'dept', 'constituency', 'grade', 'cadre'], ELIG_KEYS = ['eligible', 'iseligible', 'status', 'active'];
+const NOT_ELIGIBLE = ['false', 'no', 'n', '0', 'noteligible', 'ineligible', 'inactive', 'disabled', 'blocked', 'removed'];
+function readRecord(key, v, useKey) {
+  if (!v || typeof v !== 'object') return { error: 'not a member record' };
+  const mid = String(pick(v, ID_KEYS) || (useKey ? decodeURIComponent(String(key)) : '')).trim();
+  if (!mid) return { error: 'no Member ID' };
+  const raw = pick(v, MOB_KEYS); if (raw === '') return { mid, error: 'no mobile number' };
+  const digits = String(typeof raw === 'number' ? Math.round(raw) : raw).replace(/\D/g, '');
+  if (digits.length < 10) return { mid, error: `mobile number has only ${digits.length} digits` };
+  const el = pick(v, ELIG_KEYS);
+  return { member_id: mid, mobile: digits.slice(-10), name: String(pick(v, NAME_KEYS)).trim(), email: String(pick(v, MAIL_KEYS)).trim(), category: String(pick(v, CAT_KEYS)).trim(), eligible: NOT_ELIGIBLE.includes(keyOf(el)) ? 0 : 1 };
 }
-// The phone number is checked against the uploaded data in Firebase (falls back to the local copy if Firebase is unreachable)
+// Copy one record into the local working database. Returns { row, state: 'added' | 'updated' | 'same' | 'error', error }
+function saveLocal(r) {
+  const ex = db.prepare('SELECT * FROM members WHERE member_id=?').get(r.member_id);
+  try {
+    if (ex) {
+      if (ex.mobile === r.mobile && (ex.name || '') === r.name && (ex.email || '') === r.email && (ex.category || '') === r.category && ex.eligible === r.eligible) return { row: ex, state: 'same' };
+      db.prepare('UPDATE members SET name=?,mobile=?,email=?,category=?,eligible=? WHERE id=?').run(r.name, r.mobile, r.email, r.category, r.eligible, ex.id);
+      return { row: db.prepare('SELECT * FROM members WHERE id=?').get(ex.id), state: 'updated' };
+    }
+    db.prepare('INSERT INTO members(member_id,name,mobile,email,category,eligible) VALUES(?,?,?,?,?,?)').run(r.member_id, r.name, r.mobile, r.email, r.category, r.eligible);
+    return { row: db.prepare('SELECT * FROM members WHERE member_id=?').get(r.member_id), state: 'added' };
+  } catch (e) {
+    const o = db.prepare('SELECT member_id FROM members WHERE mobile=? AND member_id<>?').get(r.mobile, r.member_id);
+    return { state: 'error', error: o ? `mobile number is already used by member ${o.member_id}` : e.message };
+  }
+}
+// The phone number is checked against the uploaded data in Firebase first; if Firebase has no exact match or is unreachable, the local copy of the list is used
 async function findMember(mobile) {
   if (rtdbReady()) {
     try {
-      const d = await rtdb('GET', `members.json?orderBy=${encodeURIComponent('"mobile"')}&equalTo=${encodeURIComponent(JSON.stringify(mobile))}`), v = d && Object.values(d)[0];
-      if (!v) return null; const m = upsertLocal(v); return m && m.eligible ? m : null;
+      const d = await rtdb('GET', `members.json?orderBy=${encodeURIComponent('"mobile"')}&equalTo=${encodeURIComponent(JSON.stringify(mobile))}`), hit = d && Object.entries(d).find(([, v]) => v);
+      if (hit) { const r = readRecord(hit[0], hit[1], true); if (!r.error) { const s = saveLocal(r); if (s.row) return s.row.eligible ? s.row : null; } }
     } catch (e) { console.error('Firebase lookup failed, using local copy:', e.message); }
   }
   return db.prepare('SELECT * FROM members WHERE mobile=? AND eligible=1').get(mobile) || null;
 }
-async function pullMembers() { const d = await rtdb('GET', 'members.json') || {}; let n = 0, skipped = 0; for (const v of Object.values(d)) (upsertLocal(v) ? n++ : skipped++); return { pulled: n, skipped }; }
+// Find where the member list is stored: normally "members", but a differently named top-level item is accepted too
+const MEMBER_ROOT = /^(members?|member[_ -]?list|employees?|users?)$/i;
+async function memberPath() {
+  const direct = await rtdb('GET', 'members.json?shallow=true');
+  if (direct && Object.keys(direct).length) return { path: 'members', keys: ['members'] };
+  const root = await rtdb('GET', '.json?shallow=true'), keys = Object.keys(root || {}), alt = keys.find(k => MEMBER_ROOT.test(k) && k !== 'members');
+  return alt ? { path: alt, keys } : { path: null, keys };
+}
+const fbSyncState = { at: null, error: null, last: null, running: null, path: 'members' };
+async function pullMembers() {
+  if (fbSyncState.running) return fbSyncState.running;
+  return fbSyncState.running = (async () => {
+    try {
+      const where = await memberPath(), out = { pulled: 0, added: 0, updated: 0, skipped: 0, problems: [], path: where.path };
+      if (!where.path) {
+        out.note = where.keys.length ? `No member list was found at "members". Your Firebase database contains: ${where.keys.join(', ')}. Members must be stored under members/<Member ID>.` : 'The Firebase database is empty. Upload a member file, or use "Send all members to Firebase".';
+        Object.assign(fbSyncState, { at: new Date().toISOString(), error: null, last: out }); return out;
+      }
+      const d = await rtdb('GET', where.path + '.json'), isArr = Array.isArray(d), entries = isArr ? d.map((v, i) => [String(i), v]) : Object.entries(d || {}), seen = new Map();
+      db.exec('BEGIN');
+      try {
+        for (const [k, v] of entries) {
+          if (v === null || v === undefined) continue;   // empty slots in a list are ignored
+          const r = readRecord(k, v, !isArr), label = (r.member_id || r.mid || k);
+          if (r.error) { out.skipped++; out.problems.push(`${label}: ${r.error}`); continue; }
+          if (seen.has(r.mobile)) { out.skipped++; out.problems.push(`${label}: same mobile number as ${seen.get(r.mobile)} in this list`); continue; }
+          seen.set(r.mobile, r.member_id);
+          const s = saveLocal(r);
+          if (s.state === 'error') { out.skipped++; out.problems.push(`${label}: ${s.error}`); } else { out.pulled++; if (s.state === 'added') out.added++; else if (s.state === 'updated') out.updated++; }
+        }
+        db.exec('COMMIT');
+      } catch (e) { try { db.exec('ROLLBACK'); } catch (x) { /* nothing open */ } throw e; }
+      out.problems = out.problems.slice(0, 15); Object.assign(fbSyncState, { at: new Date().toISOString(), error: null, last: out, path: where.path }); return out;
+    } catch (e) { fbSyncState.error = e.message; throw e; } finally { fbSyncState.running = null; }
+  })();
+}
 async function pushAllMembers() { const map = {}; for (const m of db.prepare('SELECT * FROM members').all()) map[fbKey(m.member_id)] = fbVal(m.member_id, m.name, m.mobile, m.email, m.category, m.eligible); return { pushed: await fbPushMany(map) }; }
 // Voting records in Firebase. votes/<election>/<member ID> = who voted, with all their details (NOT who they voted for).
 // ballots/<election>/<transaction> = the choice, with no member ID and no time, so a vote can never be traced back to a person.
@@ -462,8 +521,18 @@ app.get('/api/admin/notices', admin, (req, res) => res.json(db.prepare(`SELECT n
 // Voted / yet-to-vote lists (who participated, never whom they voted for)
 app.get('/api/admin/firebase', admin, async (req, res) => {
   if (!rtdbReady()) return res.json({ configured: false });
-  try { const k = await rtdb('GET', 'members.json?shallow=true'); res.json({ configured: true, in_firebase: Object.keys(k || {}).length, local: db.prepare('SELECT COUNT(*) c FROM members').get().c }); }
-  catch (e) { res.json({ configured: true, error: e.message }); }
+  try {
+    const w = await memberPath(), keys = w.path ? Object.keys(await rtdb('GET', w.path + '.json?shallow=true') || {}) : [], have = new Set(keys), mine = db.prepare('SELECT member_id FROM members').all();
+    res.json({ configured: true, in_firebase: keys.length, local: mine.length, only_local: mine.filter(m => !have.has(fbKey(m.member_id)) && !have.has(m.member_id)).length, path: w.path, others: w.path ? [] : w.keys, last_sync: fbSyncState.at, last_error: fbSyncState.error, last: fbSyncState.last });
+  } catch (e) { res.json({ configured: true, error: e.message }); }
+});
+// Called by the Members screen when it opens and every few seconds while it stays open; skips the work if a sync just ran
+let lastAuto = 0;
+app.post('/api/admin/firebase/sync', admin, async (req, res) => {
+  if (!rtdbReady()) return res.json({ configured: false });
+  if (Date.now() - lastAuto < 8000 && !req.body.force) return res.json({ configured: true, throttled: true, changed: 0 });
+  lastAuto = Date.now();
+  try { const r = await pullMembers(); res.json({ configured: true, changed: r.added + r.updated, ...r }); } catch (e) { res.status(502).json({ error: 'Could not read the member list from Firebase: ' + e.message }); }
 });
 app.post('/api/admin/firebase/push', admin, async (req, res) => { if (!rtdbReady()) return res.status(400).json({ error: 'Firebase is not connected yet. In Hostinger add FIREBASE_SERVICE_ACCOUNT (or FIREBASE_DB_SECRET) and restart the app.' }); try { const r = await pushAllMembers(); log(req, 'admin', 'FIREBASE_PUSH', null, r); res.json({ ok: true, ...r }); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.post('/api/admin/firebase/push-votes', admin, async (req, res) => { if (!rtdbReady()) return res.status(400).json({ error: 'Firebase is not connected yet. In Hostinger add FIREBASE_SERVICE_ACCOUNT (or FIREBASE_DB_SECRET) and restart the app.' }); try { const r = await pushAllVotes(); log(req, 'admin', 'FIREBASE_PUSH_VOTES', null, r); res.json({ ok: true, ...r }); } catch (e) { res.status(502).json({ error: e.message }); } });
@@ -621,5 +690,8 @@ app.use((err, req, res, next) => {
   console.error('ERROR', err); res.status(500).json({ error: 'Server error. Please try again.' });
 });
 app.listen(process.env.PORT || 3000, () => console.log('Election portal listening on', process.env.PORT || 3000, 'db:', DB_FILE));
-// On start: load members from Firebase (so they survive redeploys); if Firebase has none yet, send the local ones up
-if (rtdbReady()) setTimeout(async () => { try { const k = await rtdb('GET', 'members.json?shallow=true'); if (k && Object.keys(k).length) console.log('Members loaded from Firebase:', await pullMembers()); else if (db.prepare('SELECT COUNT(*) c FROM members').get().c) console.log('Members sent to Firebase:', await pushAllMembers()); } catch (e) { console.error('Firebase start-up sync failed:', e.message); } }, 1500);
+// On start: load members from Firebase (so they survive redeploys); if Firebase has none yet, send the local ones up. Then keep the local copy fresh every minute.
+if (rtdbReady()) {
+  setTimeout(async () => { try { const w = await memberPath(); if (w.path) console.log('Members loaded from Firebase:', JSON.stringify((({ problems, ...x }) => x)(await pullMembers()))); else if (db.prepare('SELECT COUNT(*) c FROM members').get().c) console.log('Members sent to Firebase:', await pushAllMembers()); } catch (e) { console.error('Firebase start-up sync failed:', e.message); } }, 1500);
+  setInterval(() => { pullMembers().catch(e => console.error('Firebase background sync failed:', e.message)); }, 60000).unref?.();
+}
