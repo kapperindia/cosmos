@@ -73,6 +73,7 @@ const norm = m => String(m || '').replace(/\D/g, '').slice(-10), hash = s => cry
 const status = e => { const n = Date.now(); if (e.locked) return 'LOCKED'; if (n < Date.parse(e.start_at)) return 'UPCOMING'; if (n <= Date.parse(e.end_at)) return 'OPEN'; return n >= Date.parse(e.result_at || e.end_at) ? 'RESULTS' : 'CLOSED'; };
 const hits = new Map(), limit = (n, ms) => (req, res, next) => { const k = req.ip + req.path, now = Date.now(), a = (hits.get(k) || []).filter(t => now - t < ms); a.push(now); hits.set(k, a); a.length > n ? res.status(429).json({ error: 'Too many attempts. Please try again later.' }) : next(); };
 try { db.exec('ALTER TABLE voter_participation ADD COLUMN via TEXT'); } catch (e) { /* already there */ }
+try { db.exec('ALTER TABLE candidates ADD COLUMN photo TEXT'); } catch (e) { /* already there */ }
 const adminTokens = new Set(), sessions = new Map();
 const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '80mb' }));
 // Mark the database "changed" after any successful write so the background job backs it up
@@ -124,7 +125,7 @@ app.get(['/privacy', '/privacy-policy'], (req, res) => {
 });
 
 // Works whether index.html sits in ./public/ or in the repo root (only index.html is ever served from the root, never server.js or the database)
-const BUILD = '2026-10-14a-firebase-list-autosync';
+const BUILD = '2026-10-14b-candidate-photos';
 const PUB = path.join(__dirname, 'public'), CANDS = [path.join(PUB, 'index.html'), path.join(__dirname, 'index.html')].filter(f => fs.existsSync(f)).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs), HOME = CANDS[0];  // if two copies exist, the newest one wins
 const sendHome = (_, res) => HOME ? res.sendFile(HOME, { headers: { 'Cache-Control': 'no-cache' } }) : res.status(500).send('index.html not found. Place it in the public/ folder.');
 app.get(['/', '/index.html'], sendHome);
@@ -134,7 +135,7 @@ const admin = (req, res, next) => adminTokens.has(req.get('x-token')) ? next() :
 const voter = (req, res, next) => { const s = sessions.get(req.get('x-session')); if (!s || s.exp < Date.now()) return res.status(401).json({ error: 'Session expired. Please verify your OTP again.' }); req.member = s.member_id; req.via = s.via || 'otp'; next(); };
 const view = e => {
   const st = status(e), eligible = db.prepare('SELECT COUNT(*) c FROM members WHERE eligible=1').get().c, polled = db.prepare('SELECT COUNT(*) c FROM voter_participation WHERE election_id=?').get(e.id).c;
-  const cands = db.prepare('SELECT id,code,name,description FROM candidates WHERE election_id=? AND active=1 ORDER BY sort,id').all(e.id);
+  const cands = db.prepare("SELECT id,code,name,description,(photo IS NOT NULL AND photo<>'') has_photo,LENGTH(photo) plen FROM candidates WHERE election_id=? AND active=1 ORDER BY sort,id").all(e.id).map((c, i) => ({ id: c.id, code: c.code, serial: i + 1, name: c.name, description: c.description, photo: c.has_photo ? `/api/cphoto/${c.id}?v=${c.plen}` : null }));
   const o = { id: e.id, code: e.code, name: e.name, post: e.post, start_at: e.start_at, end_at: e.end_at, result_at: e.result_at || e.end_at, status: st, eligible, polled, turnout: eligible ? +(polled * 100 / eligible).toFixed(1) : 0, candidates: cands, live_candidates: !!e.live_candidates, locked: !!e.locked };
   if (e.live_candidates && st === 'OPEN') o.live = tally(e.id);
   return o;
@@ -484,23 +485,50 @@ app.get('/api/admin/members', admin, (req, res) => {
 });
 app.post('/api/admin/elections', admin, (req, res) => {
   const { name, post, start_at, end_at, result_at, candidates } = req.body;
-  if (!name || !post || !start_at || !end_at || !(candidates || []).length) return res.status(400).json({ error: 'Name, post, start, end and at least one candidate are required.' });
+  if (!name || !post || !start_at || !end_at || !(candidates || []).length || candidates.some(c => !String(c.name || '').trim())) return res.status(400).json({ error: 'Name, post, start, end and at least one candidate are required.' });
   if (Date.parse(end_at) <= Date.parse(start_at)) return res.status(400).json({ error: 'End time must be after start time.' });
+  if (candidates.some(c => c.photo && !okPhoto(c.photo))) return res.status(400).json({ error: 'Each photo must be a JPG, PNG or WEBP image under about 600 KB.' });
   const e = db.transaction(() => {
     const id = db.prepare('INSERT INTO elections(name,post,start_at,end_at,result_at) VALUES(?,?,?,?,?)').run(name, post, start_at, end_at, result_at || end_at).lastInsertRowid;
     const code = `${post.replace(/[^A-Za-z0-9]/g, '').toUpperCase()}-${new Date(start_at).getFullYear()}-${String(id).padStart(3, '0')}`;
     db.prepare('UPDATE elections SET code=? WHERE id=?').run(code, id);
-    candidates.forEach((c, i) => db.prepare('INSERT INTO candidates(election_id,code,name,description,sort) VALUES(?,?,?,?,?)').run(id, `C${String(i + 1).padStart(3, '0')}`, c.name, c.description || '', i));
+    candidates.forEach((c, i) => db.prepare('INSERT INTO candidates(election_id,code,name,description,sort,photo) VALUES(?,?,?,?,?,?)').run(id, `C${String(i + 1).padStart(3, '0')}`, String(c.name).trim(), c.description || '', i, c.photo || null));
     return code;
   })();
   log(req, 'admin', 'ELECTION_CREATED', null, e); res.json({ election_id: e });
 });
+const okPhoto = p => typeof p === 'string' && /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(p) && p.length <= 900000;
+app.get('/api/cphoto/:id', (req, res) => {   // candidate photo, shown to voters on the ballot
+  const r = db.prepare('SELECT photo FROM candidates WHERE id=? AND active=1').get(+req.params.id);
+  const m = r && r.photo && /^data:(image\/[a-z]+);base64,(.*)$/s.exec(r.photo); if (!m) return res.status(404).end();
+  res.set({ 'Content-Type': m[1], 'Cache-Control': 'public, max-age=86400', 'X-Content-Type-Options': 'nosniff' }); res.send(Buffer.from(m[2], 'base64'));
+});
 app.post('/api/admin/elections/:id/candidates', admin, (req, res) => {
-  const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id); if (!e || status(e) !== 'UPCOMING') return res.status(400).json({ error: 'Candidates can only be changed before voting starts.' });
-  const n = db.prepare('SELECT COUNT(*) c FROM candidates WHERE election_id=?').get(e.id).c;
-  if (req.body.remove) db.prepare('UPDATE candidates SET active=0 WHERE id=? AND election_id=?').run(req.body.remove, e.id);
-  else db.prepare('INSERT INTO candidates(election_id,code,name,description,sort) VALUES(?,?,?,?,?)').run(e.id, `C${String(n + 1).padStart(3, '0')}`, req.body.name, req.body.description || '', n);
-  log(req, 'admin', 'CANDIDATE_CHANGED', e.id, req.body); res.json({ ok: true });
+  const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id); if (!e || status(e) !== 'UPCOMING') return res.status(400).json({ error: 'Candidates, photos and their order can only be changed before voting starts.' });
+  const B = req.body, active = () => db.prepare('SELECT id FROM candidates WHERE election_id=? AND active=1 ORDER BY sort,id').all(e.id).map(x => x.id);
+  const renumber = ids => ids.forEach((id, i) => db.prepare('UPDATE candidates SET sort=? WHERE id=?').run(i, id));
+  const mine = id => db.prepare('SELECT id FROM candidates WHERE id=? AND election_id=? AND active=1').get(id, e.id);
+  if (B.photo != null && B.photo !== '' && !okPhoto(B.photo)) return res.status(400).json({ error: 'Photo must be a JPG, PNG or WEBP image under about 600 KB.' });
+  let what = 'ADD';
+  if (B.remove) { what = 'REMOVE'; db.prepare('UPDATE candidates SET active=0 WHERE id=? AND election_id=?').run(B.remove, e.id); renumber(active()); }
+  else if (B.move) {   // move one place up or down in the serial order
+    what = 'MOVE'; const ids = active(), i = ids.indexOf(+B.candidate_id), j = i + (B.move === 'up' ? -1 : 1);
+    if (i < 0 || j < 0 || j >= ids.length) return res.status(400).json({ error: 'Cannot move further.' });
+    [ids[i], ids[j]] = [ids[j], ids[i]]; renumber(ids);
+  } else if (B.set_serial) {   // jump straight to a serial number
+    what = 'SERIAL'; const ids = active(), i = ids.indexOf(+B.candidate_id); if (i < 0) return res.status(400).json({ error: 'Candidate not found.' });
+    const to = Math.min(Math.max(parseInt(B.set_serial, 10) || 1, 1), ids.length) - 1; ids.splice(to, 0, ids.splice(i, 1)[0]); renumber(ids);
+  } else if (B.candidate_id) {   // set or clear the photo of an existing candidate
+    what = B.photo ? 'PHOTO' : 'PHOTO_CLEARED'; if (!mine(B.candidate_id)) return res.status(400).json({ error: 'Candidate not found.' });
+    db.prepare('UPDATE candidates SET photo=? WHERE id=?').run(B.photo || null, B.candidate_id);
+  } else {
+    if (!String(B.name || '').trim()) return res.status(400).json({ error: 'Candidate name is required.' });
+    const n = db.prepare('SELECT COUNT(*) c FROM candidates WHERE election_id=?').get(e.id).c, k = active().length;
+    const id = db.prepare('INSERT INTO candidates(election_id,code,name,description,sort,photo) VALUES(?,?,?,?,?,?)').run(e.id, `C${String(n + 1).padStart(3, '0')}`, String(B.name).trim(), B.description || '', k, B.photo || null).lastInsertRowid;
+    if (B.serial) { const ids = active(), i = ids.indexOf(+id); ids.splice(Math.min(Math.max(parseInt(B.serial, 10) || 1, 1), ids.length) - 1, 0, ids.splice(i, 1)[0]); renumber(ids); }
+  }
+  log(req, 'admin', 'CANDIDATE_' + what, e.id, { candidate_id: B.candidate_id || B.remove || null, name: B.name || null, move: B.move || null, serial: B.set_serial || B.serial || null, photo: B.photo ? 'yes' : null });
+  res.json({ ok: true });
 });
 app.post('/api/admin/elections/:id/settings', admin, (req, res) => {   // extension, live-count toggle, OTP rules, emergency lock
   const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id); if (!e) return res.status(404).json({ error: 'Not found' });
