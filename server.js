@@ -77,6 +77,7 @@ try { db.exec('ALTER TABLE candidates ADD COLUMN photo TEXT'); } catch (e) { /* 
 const adminTokens = new Set(), sessions = new Map();
 const app = express(); app.set('trust proxy', 1); app.use(express.json({ limit: '80mb' }));
 // Mark the database "changed" after any successful write so the background job backs it up
+app.use((req, res, next) => { const t0 = process.hrtime.bigint(); res.on('finish', () => { const ms = Number(process.hrtime.bigint() - t0) / 1e6; if (ms > 700 && req.path.startsWith('/api/')) console.warn(`SLOW ${Math.round(ms)}ms ${req.method} ${req.path}`); }); next(); });
 let dirty = false; app.use((req, res, next) => { if (req.method !== 'GET' && req.path.startsWith('/api/')) res.on('finish', () => { if (res.statusCode < 400) dirty = true; }); next(); });
 
 // Content-Security-Policy. When Firebase sign-in is configured, only Google's Firebase/reCAPTCHA hosts are additionally allowed.
@@ -125,7 +126,7 @@ app.get(['/privacy', '/privacy-policy'], (req, res) => {
 });
 
 // Works whether index.html sits in ./public/ or in the repo root (only index.html is ever served from the root, never server.js or the database)
-const BUILD = '2026-10-14b-candidate-photos';
+const BUILD = '2026-10-14c-live-speed';
 const PUB = path.join(__dirname, 'public'), CANDS = [path.join(PUB, 'index.html'), path.join(__dirname, 'index.html')].filter(f => fs.existsSync(f)).sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs), HOME = CANDS[0];  // if two copies exist, the newest one wins
 const sendHome = (_, res) => HOME ? res.sendFile(HOME, { headers: { 'Cache-Control': 'no-cache' } }) : res.status(500).send('index.html not found. Place it in the public/ folder.');
 app.get(['/', '/index.html'], sendHome);
@@ -263,9 +264,9 @@ async function fbAccessToken() {
   const d = await r.json(); if (!r.ok || !d.access_token) throw new Error('Firebase sign-in failed: ' + (d.error_description || d.error || r.status));
   fbTok = { t: d.access_token, exp: Date.now() + (d.expires_in || 3600) * 1000 }; return fbTok.t;
 }
-async function rtdb(method, pathq, body) {
+async function rtdb(method, pathq, body, opts = {}) {
   const auth = process.env.FIREBASE_DB_SECRET ? 'auth=' + encodeURIComponent(process.env.FIREBASE_DB_SECRET) : 'access_token=' + await fbAccessToken();
-  const r = await fetch(`${process.env.FIREBASE_DATABASE_URL.replace(/\/$/, '')}/${pathq}${pathq.includes('?') ? '&' : '?'}${auth}`, { method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const r = await fetch(`${process.env.FIREBASE_DATABASE_URL.replace(/\/$/, '')}/${pathq}${pathq.includes('?') ? '&' : '?'}${auth}`, { method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(opts.timeout || 20000) });
   const d = await r.json().catch(() => null); if (!r.ok) throw new Error((d && d.error) || 'Firebase database error ' + r.status); return d;
 }
 const fbVal = (mid, name, mobile, email, category, eligible) => ({ member_id: String(mid), name: name || '', mobile, email: email || '', category: category || '', eligible: !!eligible, updated_at: new Date().toISOString() });
@@ -306,9 +307,13 @@ function saveLocal(r) {
 }
 // The phone number is checked against the uploaded data in Firebase first; if Firebase has no exact match or is unreachable, the local copy of the list is used
 async function findMember(mobile) {
+  // Fast path: the member list is kept in step with Firebase every minute, so a voter we already know is answered instantly from this server.
+  // (Waiting on Firebase for every voter made the screen lag during a live election.)
+  const fresh = fbSyncState.at && Date.now() - Date.parse(fbSyncState.at) < 5 * 60000;
+  if (fresh) { const row = db.prepare('SELECT * FROM members WHERE mobile=?').get(mobile); if (row) return row.eligible ? row : null; }
   if (rtdbReady()) {
     try {
-      const d = await rtdb('GET', `members.json?orderBy=${encodeURIComponent('"mobile"')}&equalTo=${encodeURIComponent(JSON.stringify(mobile))}`), hit = d && Object.entries(d).find(([, v]) => v);
+      const d = await rtdb('GET', `members.json?orderBy=${encodeURIComponent('"mobile"')}&equalTo=${encodeURIComponent(JSON.stringify(mobile))}`, undefined, { timeout: 3000 }), hit = d && Object.entries(d).find(([, v]) => v);
       if (hit) { const r = readRecord(hit[0], hit[1], true); if (!r.error) { const s = saveLocal(r); if (s.row) return s.row.eligible ? s.row : null; } }
     } catch (e) { console.error('Firebase lookup failed, using local copy:', e.message); }
   }
@@ -419,7 +424,14 @@ async function backupNow(daily) {
     dirty = false; lastBackup = new Date().toISOString(); lastBackupError = null; return { ok: true, at: lastBackup };
   } catch (e) { lastBackupError = e.message; console.error('Backup failed:', e.message); return { error: e.message }; } finally { backing = false; }
 }
-setInterval(() => { if (dirty) backupNow(false); }, 20000);
+// The snapshot copies the whole database, which briefly freezes the server. While people are voting that would make every screen lag,
+// so during a busy period it waits for a quiet moment (no requests for 8 s), takes one at most every 90 s, and never waits longer than 4 min.
+let lastReq = 0, lastBackupTry = Date.now();
+app.use((req, res, next) => { lastReq = Date.now(); next(); });
+setInterval(() => {
+  if (!dirty) return; const now = Date.now(), quiet = now - lastReq > 8000, since = now - lastBackupTry;
+  if ((quiet && since > 90000) || since > 240000) { lastBackupTry = now; backupNow(false); }
+}, 5000);
 setInterval(() => backupNow(true), 6 * 3600 * 1000);
 setTimeout(() => backupNow(true), 15000);
 process.on('SIGTERM', async () => { await backupNow(false); process.exit(0); });
